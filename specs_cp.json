@@ -1,0 +1,58 @@
+[
+  {
+    "name": "A_default",
+    "env_id": "CartPole-v1",
+    "seed": 0,
+    "params": null
+  },
+  {
+    "name": "B_heavier_pole",
+    "env_id": "CartPole-v1",
+    "seed": 1,
+    "params": {
+      "masspole": 0.2
+    }
+  },
+  {
+    "name": "C_stronger_gravity",
+    "env_id": "CartPole-v1",
+    "seed": 2,
+    "params": {
+      "gravity": 12.0
+    }
+  },
+  {
+    "name": "D_longer_pole",
+    "env_id": "CartPole-v1",
+    "seed": 3,
+    "params": {
+      "length": 1.2
+    }
+  },
+  {
+    "name": "E_weaker_force",
+    "env_id": "CartPole-v1",
+    "seed": 4,
+    "params": {
+      "force_mag": 7.5
+    }
+  },
+  {
+    "name": "F_faster_dynamics",
+    "env_id": "CartPole-v1",
+    "seed": 5,
+    "params": {
+      "tau": 0.015
+    }
+  },
+  {
+    "name": "G_combo",
+    "env_id": "CartPole-v1",
+    "seed": 6,
+    "params": {
+      "gravity": 11.0,
+      "length": 1.1,
+      "force_mag": 8.5
+    }
+  }
+]

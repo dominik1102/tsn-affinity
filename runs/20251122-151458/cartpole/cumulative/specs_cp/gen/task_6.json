@@ -1,0 +1,6 @@
+{
+  "step": 6,
+  "task_name": "F_faster_dynamics",
+  "n_trajectories": 10,
+  "traj_file": null
+}
