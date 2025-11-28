@@ -49,12 +49,12 @@ Available strategies: `naive`, `cumulative`, `ewc`.
 
 CartPole:
 ```bash
-python bin/clb-run-dt.py --spec specs_cp.json --strategy cumulative --steps-per-task 5000 --episodes-eval 5
+python bin/clb-run-dt.py --spec specs_cp.json --strategy cumulative --steps-per-task 5000 --episodes-eval 5 --device cuda
 ```
 
 Atari:
 ```bash
-python bin/clb-run-dt.py --spec specs_atari.json --strategy cumulative --steps-per-task 2 --episodes-eval 10
+python bin/clb-run-dt.py --spec specs_atari.json --strategy cumulative --steps-per-task 20000 --episodes-eval 10 --device cuda
 ```
 
 Panda (offline, PandaReach → PandaPush → PandaPickAndPlace):  

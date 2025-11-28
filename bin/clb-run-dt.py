@@ -76,7 +76,7 @@ def main():
     for i, (name, env) in enumerate(envs.items()):
         print(f"[Task {i + 1}/{n}] {name}")
         onpol = collect_trajectories(env, strategy.model, n_episodes=args.collect_episodes,
-                                     max_len=5000, target_return=1.0, device=args.device)
+                                     max_len=1000, target_return=1.0, device=args.device)
         traj_path = None
         if args.dump_trajs:
             traj_path = os.path.join(run_dir, "gen", f"trajs_task{i}.pkl")

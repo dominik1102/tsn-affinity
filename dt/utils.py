@@ -50,11 +50,11 @@ def _to_chw(arr: np.ndarray) -> np.ndarray:
 
 @torch.no_grad()
 def evaluate_dt(
-    strategy,
-    env,
-    episodes: int,
-    device: str,
-    max_steps: int = 1000,
+        strategy,
+        env,
+        episodes: int,
+        device: str,
+        max_steps: int = 1000,
 ) -> float:
     """
     Generic evaluation for Decision Transformer policies.
@@ -71,6 +71,7 @@ def evaluate_dt(
     model.eval()
 
     for _ in range(episodes):
+        strategy.model.reset_history()
         obs, info = env.reset()
         total = 0.0
         prev_a = 0  # For continuous DT this can be ignored in .act()
@@ -114,14 +115,71 @@ def evaluate_dt(
     return float(np.mean(rets)) if rets else 0.0
 
 
-# Backwards-compatible alias for Panda-specific evaluation
+import numpy as np
+import torch
+
+
 @torch.no_grad()
-def evaluate_dt_panda(strategy, env, episodes: int, device: str) -> float:
+def evaluate_dt_panda(strategy, env, episodes: int, device: str, max_steps: int = 1000):
     """
-    Convenience alias for evaluating Panda DT models.
-    Simply calls evaluate_dt with a smaller default max_steps.
+    Evaluate a PandaDecisionTransformer-based strategy on a Panda environment.
+
+    The function:
+      - resets the model's internal history at the start of each episode,
+      - flattens observations using _flatten_panda_obs so that they match
+        the offline dataset representation,
+      - uses model.act(...) to select continuous actions,
+      - returns the average return across `episodes` episodes.
     """
-    return evaluate_dt(strategy, env, episodes, device=device, max_steps=1000)
+    model = strategy.model
+    returns: list[float] = []
+
+    for ep in range(episodes):
+        # Important: clear the DT history at the start of every episode
+        if hasattr(model, "reset_history"):
+            model.reset_history()
+
+        obs, _ = env.reset()
+        total_reward = 0.0
+        prev_action = None
+
+        for t in range(max_steps):
+            # Flatten observation to the same vector used in the offline dataset
+            obs_vec = _flatten_panda_obs(
+                obs,
+                expected_dim=getattr(model, "obs_dim", None),
+            )
+
+            # Select action using the PandaDecisionTransformer
+            action = model.act(
+                obs_vec,
+                rtg_scalar=1.0,
+                t=t,
+                prev_action=prev_action,
+                device=device,
+            )
+
+            action = np.asarray(action, dtype=np.float32).ravel()
+            act_dim_env = int(np.prod(env.action_space.shape))
+
+            if action.shape[0] < act_dim_env:
+                # Pad with zeros if the model outputs fewer dimensions than the env expects
+                pad = np.zeros(act_dim_env - action.shape[0], dtype=np.float32)
+                action = np.concatenate([action, pad], axis=0)
+            elif action.shape[0] > act_dim_env:
+                # Truncate if the model outputs more than the env expects
+                action = action[:act_dim_env]
+
+            obs, reward, done, truncated, _ = env.step(action)
+            total_reward += float(reward)
+            prev_action = action
+
+            if done or truncated:
+                break
+
+        returns.append(total_reward)
+
+    return float(np.mean(returns)) if returns else 0.0
 
 
 # ==========================
@@ -129,12 +187,12 @@ def evaluate_dt_panda(strategy, env, episodes: int, device: str) -> float:
 # ==========================
 
 def collect_trajectories(
-    env,
-    policy,
-    n_episodes: int,
-    max_len: int,
-    target_return: float,
-    device: str,
+        env,
+        policy,
+        n_episodes: int,
+        max_len: int,
+        target_return: float,
+        device: str,
 ) -> List[Trajectory]:
     """
     Collect on-policy trajectories for discrete-action environments
@@ -198,3 +256,56 @@ def collect_trajectories(
         )
 
     return trajs
+
+
+def _flatten_panda_obs(obs, expected_dim: int | None = None) -> np.ndarray:
+    """
+    Convert a Panda environment observation to a flat vector compatible
+    with PandaDecisionTransformer.
+
+    Typical patterns:
+      - Goal-based envs: obs is a dict with keys like "observation",
+        "achieved_goal", "desired_goal".
+      - Non-goal envs: obs is already a flat array/tensor.
+
+    This function:
+      1) flattens the observation to 1D,
+      2) if expected_dim is not None:
+           - pads with zeros if dim < expected_dim,
+           - truncates if dim > expected_dim.
+    """
+
+    # If it's a torch.Tensor, move to CPU/NumPy first
+    if isinstance(obs, torch.Tensor):
+        obs = obs.detach().cpu().numpy()
+
+    # Dict case (e.g., Panda goal envs)
+    if isinstance(obs, dict):
+        if "observation" in obs and "desired_goal" in obs:
+            base = np.asarray(obs["observation"], dtype=np.float32).ravel()
+            goal = np.asarray(obs["desired_goal"], dtype=np.float32).ravel()
+            flat = np.concatenate([base, goal], axis=0)
+        elif "observation" in obs:
+            # Only 'observation' is available
+            flat = np.asarray(obs["observation"], dtype=np.float32).ravel()
+        else:
+            # Generic fallback: concatenate all values in sorted key order
+            parts = [
+                np.asarray(v, dtype=np.float32).ravel()
+                for k, v in sorted(obs.items())
+            ]
+            flat = np.concatenate(parts, axis=0)
+    else:
+        # Already a plain vector / array
+        flat = np.asarray(obs, dtype=np.float32).ravel()
+
+    # Adjust dimension to match what the model expects
+    if expected_dim is not None:
+        d = flat.shape[-1]
+        if d < expected_dim:
+            pad = np.zeros(expected_dim - d, dtype=np.float32)
+            flat = np.concatenate([flat, pad], axis=0)
+        elif d > expected_dim:
+            flat = flat[:expected_dim]
+
+    return flat

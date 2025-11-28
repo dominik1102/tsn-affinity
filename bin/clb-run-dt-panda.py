@@ -58,9 +58,16 @@ def main():
         print(f"[PANDA TASK] {name} / env={env_id} / data={ds_path}")
         envs[name] = gym.make(env_id)
         trajs = load_panda_offline_pkl(ds_path)
+        traj0 = trajs[0]
         assert len(trajs) > 0, f"No trajectories loaded from {ds_path}"
         all_trajs.append(trajs)
+        if isinstance(trajs, dict):
+            acts0 = traj0["actions"]  # [T, act_dim]
+        else:
+            acts0 = traj0.actions  # zależy od formatu
 
+        print("dataset actions shape:", np.asarray(acts0).shape)  # np. (N, 3) albo (N, 4)
+    # exit()
     task_names = list(envs.keys())
     n = len(task_names)
     P = np.zeros((n, n), dtype=np.float32)

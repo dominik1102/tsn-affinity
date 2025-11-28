@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 import pickle
 import numpy as np
+import torch
 
 from dt.dataset import Trajectory, discount_cumsum
 
@@ -163,15 +164,18 @@ def make_minibatches_panda(
     seq_len: int,
     batch_size: int,
     device: str,
+    act_dim: int,
+    obs_dim: int,
 ):
     """
-    Minibatch generator dla Pandy z ciągłymi akcjami.
-    Zwraca:
-      obs:    [B, L, obs_dim]
-      actions:[B, L, act_dim]
-      rtg:    [B, L, 1]
-      ts:     [B, L]
-      mask:   [B, L]  (1 dla prawdziwych kroków, 0 dla paddingu)
+    Minibatch generator for Panda with continuous actions.
+
+    Returns:
+      obs:     [B, L, obs_dim]   (padded/truncated to `obs_dim`)
+      actions: [B, L, act_dim]   (padded/truncated to `act_dim`)
+      rtg:     [B, L, 1]
+      ts:      [B, L]
+      mask:    [B, L]  (1 for real steps, 0 for padding)
     """
     import numpy as _np
     import torch
@@ -182,13 +186,19 @@ def make_minibatches_panda(
         for _ in range(batch_size):
             tr = _np.random.choice(trajs)
             T = tr.actions.shape[0]
+
             start = 0 if T <= seq_len else _np.random.randint(0, T - seq_len + 1)
             end = min(start + seq_len, T)
 
-            o = tr.obs[start:end]          # [L, obs_dim]
-            a = tr.actions[start:end]      # [L, act_dim]
+            # Slice trajectory
+            o = tr.obs[start:end]          # [L, D_obs_task]
+            a = tr.actions[start:end]      # [L, D_act_task]
             rtg = tr.returns_to_go[start:end]
             ts = tr.timesteps[start:end]
+
+            # 🔑 unify dimensions across tasks
+            o = pad_obs_to_dim(o, obs_dim)         # [L, obs_dim]
+            a = pad_actions_to_dim(a, act_dim)     # [L, act_dim]
 
             L = a.shape[0]
             pad = seq_len - L
@@ -196,7 +206,7 @@ def make_minibatches_panda(
             mask = _np.zeros(seq_len, dtype=_np.float32)
 
             if pad > 0:
-                # pad at END
+                # pad at the END in time dimension
                 o = _np.pad(o, ((0, pad), (0, 0)), mode="constant")
                 a = _np.pad(a, ((0, pad), (0, 0)), mode="constant")
                 rtg = _np.pad(rtg, (0, pad), mode="constant")
@@ -218,3 +228,36 @@ def make_minibatches_panda(
         mask = torch.tensor(_np.stack(B_mask), dtype=torch.float32, device=device)
 
         yield obs, actions, rtg, ts, mask
+
+
+
+
+def pad_actions_to_dim(actions: np.ndarray, act_dim: int) -> np.ndarray:
+    """
+    actions: [T, D], act_dim: target dimension (e.g. 4)
+
+    Returns [T, act_dim], padding with zeros if D < act_dim.
+    """
+    T, D = actions.shape
+    if D == act_dim:
+        return actions.astype(np.float32)
+
+    out = np.zeros((T, act_dim), dtype=np.float32)
+    out[:, :min(D, act_dim)] = actions[:, :min(D, act_dim)]
+    return out
+
+
+def pad_obs_to_dim(obs: np.ndarray, obs_dim: int) -> np.ndarray:
+    """
+    obs: [T, D], obs_dim: target observation dimension.
+
+    Returns [T, obs_dim], padding with zeros if D < obs_dim
+    or truncating if D > obs_dim.
+    """
+    T, D = obs.shape
+    if D == obs_dim:
+        return obs.astype(np.float32)
+
+    out = np.zeros((T, obs_dim), dtype=np.float32)
+    out[:, :min(D, obs_dim)] = obs[:, :min(D, obs_dim)]
+    return out

@@ -44,7 +44,6 @@ class CumulativeReplayStrategy(BaseStrategy):
         self.rehearsal = pool[: self.rehearsal_capacity]
 
 
-
 class PandaCumulativeReplayStrategy:
     """
     Cumulative replay strategy for Panda with continuous actions.
@@ -72,8 +71,16 @@ class PandaCumulativeReplayStrategy:
         self.device = device
         self.rehearsal_capacity = rehearsal_capacity
         self.rehearsal: List[Trajectory] = []
-
+        self.act_dim = act_dim
+        # For Panda we treat obs_shape as [obs_dim]
         obs_dim = obs_shape[0]
+        self.obs_dim = obs_dim
+
+
+        # IMPORTANT:
+        #   act_dim should be the global Panda action dimension
+        #   (e.g. 4 for [x, y, z, gripper]),
+        #   and must match what you used in PandaDecisionTransformer
         self.model = PandaDecisionTransformer(
             obs_dim=obs_dim,
             act_dim=act_dim,
@@ -100,20 +107,23 @@ class PandaCumulativeReplayStrategy:
         """
         Train on the current task trajectories with cumulative replay.
 
-        mix: fraction of the batch taken from the rehearsal buffer (0..1).
-             e.g. mix=0.3 -> 70% current task, 30% rehearsal (if available).
+        Args:
+            task_trajs: trajectories from the current Panda task.
+            steps: number of SGD steps.
+            batch_size: total batch size per step.
+            mix: fraction of the batch taken from the rehearsal buffer (0..1).
+                 Example: mix=0.3 -> 70% current task, 30% rehearsal (if available).
         """
-        # Ensure at least 1 sample from each source if possible
+        # Compute how many samples come from current task vs rehearsal
         main_bs = max(1, int(batch_size * (1.0 - mix)))
         reh_bs = batch_size - main_bs
         if reh_bs < 0:
             reh_bs = 0
 
-        loader_task = make_minibatches_panda(
-            task_trajs, self.seq_len, main_bs, self.device
-        )
+        # Minibatch generators
+        loader_task = make_minibatches_panda( task_trajs, self.seq_len, main_bs, self.device,  self.act_dim, self.obs_dim)
         loader_reh = (
-            make_minibatches_panda(self.rehearsal, self.seq_len, reh_bs, self.device)
+            make_minibatches_panda(self.rehearsal, self.seq_len, reh_bs, self.device,  self.act_dim, self.obs_dim)
             if (self.rehearsal and reh_bs > 0)
             else None
         )
@@ -126,7 +136,7 @@ class PandaCumulativeReplayStrategy:
             batch_ts = []
             batch_mask = []
 
-            # current task part
+            # --- current-task part ---
             obs_t, actions_t, rtg_t, ts_t, mask_t = next(loader_task)
             batch_obs.append(obs_t)
             batch_actions.append(actions_t)
@@ -134,7 +144,7 @@ class PandaCumulativeReplayStrategy:
             batch_ts.append(ts_t)
             batch_mask.append(mask_t)
 
-            # rehearsal part (if available)
+            # --- rehearsal part (if available) ---
             if loader_reh is not None:
                 obs_r, actions_r, rtg_r, ts_r, mask_r = next(loader_reh)
                 batch_obs.append(obs_r)
@@ -143,26 +153,28 @@ class PandaCumulativeReplayStrategy:
                 batch_ts.append(ts_r)
                 batch_mask.append(mask_r)
 
-            # concatenate along batch dimension
-            obs = torch.cat(batch_obs, dim=0)
-            actions = torch.cat(batch_actions, dim=0)
-            rtg = torch.cat(batch_rtg, dim=0)
-            ts = torch.cat(batch_ts, dim=0)
-            mask = torch.cat(batch_mask, dim=0)
+            # Concatenate along batch dimension
+            obs = torch.cat(batch_obs, dim=0)         # [B, L, obs_dim]
+            actions = torch.cat(batch_actions, dim=0) # [B, L, act_dim]
+            rtg = torch.cat(batch_rtg, dim=0)         # [B, L, 1]
+            ts = torch.cat(batch_ts, dim=0)           # [B, L]
+            mask = torch.cat(batch_mask, dim=0)       # [B, L]
 
-            # previous actions: shift along time dimension, first prev = 0
+            # Previous actions: shift along time dimension, first prev = 0
             prev_actions = torch.roll(actions, shifts=1, dims=1)
             prev_actions[:, 0, :] = 0.0
 
+            # Forward through PandaDecisionTransformer
             pred = self.model(obs, prev_actions, rtg, ts)  # [B, L, act_dim]
 
             # MSE per step, then mask out padding
             mse_per_step = ((pred - actions) ** 2).mean(dim=-1)  # [B, L]
-            # avoid division by zero if mask is all zeros (shouldn't happen, but safe)
+
             valid = mask.sum()
             if valid.item() > 0:
                 loss = (mse_per_step * mask).sum() / valid
             else:
+                # Safety fallback (should not happen)
                 loss = mse_per_step.mean()
 
             self.opt.zero_grad(set_to_none=True)
@@ -175,10 +187,13 @@ class PandaCumulativeReplayStrategy:
     def after_task(self, task_trajs: List[Trajectory]):
         """
         Update the rehearsal buffer after finishing a task:
+
         - pool = old buffer + current task trajectories
-        - shuffle and keep only up to rehearsal_capacity
+        - shuffle and keep only up to `rehearsal_capacity`
         """
         pool = self.rehearsal + task_trajs
         random.shuffle(pool)
         self.rehearsal = pool[: self.rehearsal_capacity]
+
+
 
