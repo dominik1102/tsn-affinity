@@ -69,7 +69,37 @@ python bin/clb-run-dt-panda.py --strategy cumulative --steps-per-task 50000 --ep
 
 ---
 
-### 4. Additional parameters
+### 4. Single-task Decision Transformer (no continual baseline)
+
+These scripts train a **separate DT for each task independently** (no replay, no CL),
+and report per-task performance. Useful as a “upper bound” / reference for CL runs.
+
+#### CartPole / Atari (discrete)
+
+```bash
+# Single-task DT for each task in the spec (works for CartPole or Atari)
+python bin/clb-run-dt-cartpole-single.py   --spec specs_cp.json   --seq-len 20   --steps-per-task 10000    --collect-episodes 10   --episodes-eval 5   --device cuda
+```
+
+For Atari just change the spec:
+
+```bash
+python bin/clb-run-dt-atari-single.py   --spec specs_atari.json  --steps 20000  --max-ep-len 1000 --seq-len 20  --collect-episodes 5   --episodes-eval 10   --device cuda
+```
+
+#### Panda (continuous, offline datasets)
+
+```bash
+python bin/clb-run-dt-panda-single.py  --datasets-root resources/datasets   --seq-len 20   --steps-per-task 50000   --batch-size 64   --episodes-eval 5   --device cuda
+```
+
+`clb-run-dt-panda-single.py` trains one PandaDecisionTransformer per task
+(PandaReach, PandaPush, PandaPickAndPlace) only on its own offline dataset
+and then evaluates it on the corresponding `panda_gym` environment.
+
+---
+
+### 5. Additional parameters
 
 - `--seq-len` — sequence length (default: 20),
 - `--warm-episodes` — number of episodes for initial bootstrap of DT (random trajectories),
@@ -103,7 +133,7 @@ Analysis (heatmaps + CSV) with `analyze_runs.py` on a specific run directory, e.
 
 CartPole / Atari:
 ```bash
-python analyze_runs.py --run-dir runs/20251122-151458/cartpole/cumulative/specs_cp
+python analyze_runs.py --run-dir runs/20251128-152557/atari/cumulative/specs_atari
 ```
 
 Panda (example; path depends on timestamp and strategy):
