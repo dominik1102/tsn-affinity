@@ -3,34 +3,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-
-class ObsEncoder(nn.Module):
-    """
-    Simple MLP encoder for vector observations.
-    """
-
-    def __init__(self, obs_dim: int, d_model: int):
-        super().__init__()
-        self.enc = nn.Sequential(
-            nn.Linear(obs_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B*L, obs_dim]
-
-        Returns:
-            Tensor of shape [B*L, d_model].
-        """
-        return self.enc(x)
+from dt.model import DecisionTransformerConfig, ObsEncoder, DTBackbone
 
 
 class PandaDecisionTransformer(nn.Module):
     """
-    Decision Transformer for continuous Panda actions.
+    Decision Transformer for continuous Panda actions, built on top of DTBackbone.
 
     During training:
         obs:       [B, L, obs_dim]
@@ -51,39 +29,35 @@ class PandaDecisionTransformer(nn.Module):
         n_heads: int = 4,
         seq_len: int = 20,
         p_drop: float = 0.1,
+        max_ep_len: int = 2048,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.d_model = d_model
         self.act_dim = act_dim
         self.obs_dim = obs_dim
+        self.max_ep_len = max_ep_len
 
-        # Encoders
-        self.obs_enc = ObsEncoder(obs_dim, d_model)
-        self.embed_action = nn.Linear(act_dim, d_model)
-        self.embed_rtg = nn.Linear(1, d_model)
-        self.embed_t = nn.Embedding(2048, d_model)
+        # Reuse the generic ObsEncoder from above (vector observations)
+        self.obs_enc = ObsEncoder((obs_dim,), d_model)
 
-        enc_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=4 * d_model,
+        # DTBackbone configuration (continuous actions)
+        config = DecisionTransformerConfig(
+            n_layer=n_layers,
+            n_head=n_heads,
+            n_embd=d_model,
             dropout=p_drop,
-            batch_first=True,
-            activation="gelu",
+            bias=False,
+            K=seq_len,
+            max_ep_len=max_ep_len,
+            state_dim=d_model,   # state = encoded observation
+            act_dim=act_dim,     # continuous actions
+            act_discrete=False,  # <-- continuous
+            act_vocab_size=1,    # unused for continuous
+            act_tanh=False,
+            tanh_embeddings=False,
         )
-        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
-        self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, act_dim),
-        )
-
-        # Causal mask for up to seq_len timesteps (3 tokens per step)
-        max_tokens = seq_len * 3
-        causal_mask = torch.triu(
-            torch.ones(max_tokens, max_tokens, dtype=torch.bool), diagonal=1
-        )
-        self.register_buffer("causal_mask", causal_mask)
+        self.dt = DTBackbone(config)
 
         # Internal history buffers for act()
         self.reset_history()
@@ -108,39 +82,39 @@ class PandaDecisionTransformer(nn.Module):
         Returns:
             Tensor of shape [B, L, act_dim] with predicted actions.
         """
-        B, L, _ = obs.shape
-
-        # Encode observations
-        s_tok = self.obs_enc(obs.view(B * L, -1)).view(B, L, -1)
-        a_tok = self.embed_action(actions)
-        r_tok = self.embed_rtg(rtg)
-        t_tok = self.embed_t(
-            timesteps.clamp(max=self.embed_t.num_embeddings - 1)
-        )
-
-        # Stack tokens [r, s, a] per timestep -> [B, 3L, d_model]
-        tokens = torch.stack([r_tok, s_tok, a_tok], dim=2).reshape(
-            B, L * 3, self.d_model
-        )
-        tokens = tokens + t_tok.repeat_interleave(3, dim=1)
-
-        # Causal mask: prevent attending to future tokens
-        T = tokens.size(1)
-        if T <= self.causal_mask.size(0):
-            attn_mask = self.causal_mask[:T, :T]
-        else:
-            attn_mask = torch.triu(
-                torch.ones(T, T, dtype=torch.bool, device=tokens.device),
-                diagonal=1,
+        if obs.dim() != 3:
+            raise ValueError(
+                f"PandaDecisionTransformer.forward expects obs of shape [B, L, obs_dim], "
+                f"got {obs.shape}"
             )
 
-        z = self.transformer(tokens, mask=attn_mask)
+        B, L, _ = obs.shape
+        device = obs.device
 
-        # Take only "state" positions: indices 1, 4, 7, ... = 3*t + 1
-        pos = torch.arange(1, L * 3, 3, device=obs.device)
-        z_state = z[:, pos, :]  # [B, L, d_model]
+        # --- encode observations -> states [B, L, d_model] ---
+        obs_flat = obs.view(B * L, -1)                # [B*L, obs_dim]
+        s_tok = self.obs_enc(obs_flat).view(B, L, -1) # [B, L, d_model]
 
-        pred_actions = self.head(z_state)  # [B, L, act_dim]
+        # actions, rtg, timesteps
+        actions = actions.to(device)
+        rtg = rtg.to(device)
+        timesteps = timesteps.to(device).long()
+        timesteps = torch.clamp(timesteps, max=self.max_ep_len - 1)
+
+        # full attention mask (no padding for now)
+        attn_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+
+        # Call DTBackbone in "training mode" (targets != None) to get predictions for all L
+        # For continuous actions DTBackbone uses MSE internally, but we ignore the loss here
+        pred_actions, _ = self.dt(
+            states=s_tok,
+            actions=actions,
+            rtgs=rtg,
+            tsteps=timesteps,
+            attn_mask=attn_mask,
+            targets=actions,  # just to get [B, L, act_dim] outputs
+        )
+        # pred_actions: [B, L, act_dim]
         return pred_actions
 
     # ------------------------------------------------------------------
@@ -180,13 +154,16 @@ class PandaDecisionTransformer(nn.Module):
             rtg_scalar: scalar return-to-go (placeholder is fine).
             t: environment timestep.
             prev_action: unused; history is tracked inside the model.
-            device: 'cpu' or 'cuda'.
+            device: kept for API compatibility, actual device is taken from model params.
 
         Returns:
             action as a numpy array of shape [act_dim].
         """
         self.eval()
-        device = torch.device(device)
+
+        # Use the real device of the model parameters
+        param_device = next(self.parameters()).device
+        device = torch.device(param_device)
 
         if isinstance(obs, dict):
             raise ValueError(
@@ -213,7 +190,7 @@ class PandaDecisionTransformer(nn.Module):
         B = 1
 
         # Build observation batch: [1, L, obs_dim]
-        obs_seq = torch.stack(self._hist_obs, dim=0).unsqueeze(0)
+        obs_seq = torch.stack(self._hist_obs, dim=0).unsqueeze(0).to(device=device)
 
         # Build actions batch: previous actions per step [1, L, act_dim]
         zero_action = torch.zeros(self.act_dim, dtype=torch.float32, device=device)
@@ -241,8 +218,7 @@ class PandaDecisionTransformer(nn.Module):
         ).view(B, L, 1)
 
         ts_seq = torch.tensor(self._hist_t, dtype=torch.long, device=device)
-        max_t = self.embed_t.num_embeddings
-        ts_seq = ts_seq.clamp(max=max_t - 1).view(B, L)
+        ts_seq = ts_seq.clamp(max=self.max_ep_len - 1).view(B, L)
 
         # Forward pass over the full history
         pred_seq = self.forward(obs_seq, actions_seq, rtg_seq, ts_seq)  # [1, L, act_dim]

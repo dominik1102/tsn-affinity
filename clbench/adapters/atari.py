@@ -18,6 +18,8 @@ except Exception:
     GYM_IS_GYMNASIUM = False
 
 
+
+
 class ChannelFirstWrapper(gym.ObservationWrapper):
     """
     Ensure channel-first layout for image-like observations.
@@ -99,16 +101,28 @@ class AtariAdapter:
         return 1.0 if r > 0 else (-1.0 if r < 0 else 0.0)
 
     def _make_game(self, game: str, seed: int | None, repeat_action_prob: float):
-        # Try sticky actions; fall back to different IDs (ALE/<game>-v5, NoFrameskip, etc.)
+        # IMPORTANT:
+        # AtariPreprocessing expects base env with NO internal frameskip.
+        # So we try to force frameskip=1 here.
+        kwargs = dict(repeat_action_probability=repeat_action_prob)
+
         try:
-            env = gym.make(game, repeat_action_probability=repeat_action_prob)
+            env = gym.make(game, frameskip=1, **kwargs)
+        except TypeError:
+            # Some older gym versions may not accept frameskip kwarg
+            env = gym.make(game, **kwargs)
         except Exception:
+            # fallback logic as you had
             alt = None
             if "/" not in game and "NoFrameskip" not in game:
                 alt = f"ALE/{game}-v5"
             elif game.endswith("NoFrameskip-v4"):
                 alt = game
-            env = gym.make(alt or game)
+
+            try:
+                env = gym.make(alt or game, frameskip=1, **kwargs)
+            except TypeError:
+                env = gym.make(alt or game, **kwargs)
 
         # Seed, handling both gym and gymnasium APIs
         try:
@@ -116,6 +130,7 @@ class AtariAdapter:
         except TypeError:
             if seed is not None:
                 env.seed(seed)
+
         return env
 
     def create_env(self, spec):
@@ -158,6 +173,25 @@ class AtariAdapter:
         except Exception as e:
             # Most common reason: no opencv / no gymnasium[atari] installed
             warnings.warn(f"AtariPreprocessing unavailable/failed (OK, fallback): {e}")
+
+        # ---- STRICT CHECK: ensure preprocessing actually produced 84x84 ----
+        try:
+            # sample obs to verify shape
+            out = env.reset()
+            o = out[0] if isinstance(out, tuple) else out
+            o = np.asarray(o)
+            # handle (84,84), (84,84,1), or (1,84,84) later after ChannelFirstWrapper
+            if not (
+                    (o.ndim == 2 and o.shape == (84, 84)) or
+                    (o.ndim == 3 and o.shape[0:2] == (84, 84))  # (84,84,1) or (84,84,C)
+            ):
+                raise RuntimeError(
+                    f"AtariPreprocessing did not produce 84x84. Got obs shape={o.shape}. "
+                    "This usually means AtariPreprocessing failed (often missing opencv-python). "
+                    "Install opencv-python and gymnasium[atari], or fix wrappers."
+                )
+        except Exception as e:
+            raise RuntimeError(f"Atari preprocessing check failed: {e}")
 
         # 3) Frame stacking
         if frame_stack and frame_stack > 1:

@@ -194,16 +194,12 @@ def collect_trajectories(
         target_return: float,
         device: str,
 ) -> List[Trajectory]:
-    """
-    Collect on-policy trajectories for discrete-action environments
-    (e.g. CartPole, Atari).
-
-    Observations can be images (HWC) or vectors; images are converted to CHW.
-    The collected data is returned as a list of Trajectory objects.
-    """
     trajs: List[Trajectory] = []
 
     for _ in range(n_episodes):
+        if hasattr(policy, "reset_history"):
+            policy.reset_history()
+
         o, _ = env.reset()
         o = _to_chw(o)
         obs, actions, rewards, timesteps = [], [], [], []
@@ -212,7 +208,6 @@ def collect_trajectories(
         for t in range(max_len):
             obs.append(o)
 
-            # 🔑 ważne: ograniczamy liczbę akcji do tego env
             a = policy.act(
                 o,
                 rtg_scalar=target_return,
@@ -223,7 +218,6 @@ def collect_trajectories(
             )
             a = int(a)
 
-            # opcjonalny safety-check (możesz usunąć po debugowaniu)
             if not env.action_space.contains(a):
                 raise ValueError(
                     f"collect_trajectories: invalid action {a} for "
@@ -241,7 +235,6 @@ def collect_trajectories(
             if done or truncated:
                 break
 
-        # Stack observations into [T, C, H, W] (or [T, D] for vector obs)
         obs_arr = np.stack(obs).astype(np.float32)
         rtg = discount_cumsum(np.array(rewards, dtype=np.float32), gamma=1.0)
 

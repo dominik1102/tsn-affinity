@@ -17,8 +17,7 @@ from clbench.io.serialize import load_task_specs
 from clbench.benchmark.metrics import StandardCLMetrics
 
 from dt.model import DecisionTransformer
-from dt.dataset import make_minibatches
-from dt.utils import collect_trajectories, evaluate_dt
+from dt.utils import evaluate_dt  # we no longer need collect_trajectories
 
 
 TaskRegistry.register("cartpole", CartPoleAdapter())
@@ -33,6 +32,138 @@ class DummyStrategy:
         self.model = model
 
 
+# ====== Offline dataset loading helpers ======
+
+
+def load_npz_dataset_for_task(dataset_root: str, task_name: str):
+    """
+    Load trajectories for a given task from a .npz file produced by train_cartpole_expert.py.
+
+    Expected structure:
+        dataset_root/
+          task_name/
+            *.npz   (e.g. expert_trajs_p1.00.npz)
+
+    Inside the .npz:
+        observations:    [N, obs_dim]
+        actions:         [N]
+        rewards:         [N]
+        dones:           [N]
+        episode_lengths: [n_episodes]
+    """
+    task_dir = os.path.join(dataset_root, task_name)
+    if not os.path.isdir(task_dir):
+        raise FileNotFoundError(f"Task directory not found: {task_dir}")
+
+    # pick any .npz (e.g. expert_trajs_p1.00.npz, expert_trajs_p0.70.npz, ...)
+    candidates = [f for f in os.listdir(task_dir) if f.endswith(".npz")]
+    if not candidates:
+        raise FileNotFoundError(f"No .npz trajectory files found in {task_dir}")
+    candidates.sort()
+    npz_path = os.path.join(task_dir, candidates[-1])  # last one, e.g. highest prob, newest, etc.
+
+    print(f"[data] loading trajectories from {npz_path}")
+    data = np.load(npz_path)
+
+    observations = data["observations"]        # [N, obs_dim]
+    actions = data["actions"]                  # [N]
+    rewards = data["rewards"]                  # [N]
+    dones = data["dones"]                      # [N]  (not strictly needed)
+    episode_lengths = data["episode_lengths"]  # [n_episodes]
+
+    episodes_obs = []
+    episodes_actions = []
+    episodes_rewards = []
+
+    idx = 0
+    for L in episode_lengths:
+        L = int(L)
+        episodes_obs.append(observations[idx:idx+L])
+        episodes_actions.append(actions[idx:idx+L])
+        episodes_rewards.append(rewards[idx:idx+L])
+        idx += L
+
+    # some simple stats
+    returns = [float(np.sum(r)) for r in episodes_rewards]
+    print(
+        f"[data] episodes={len(episodes_obs)}, "
+        f"avg_return={np.mean(returns):.1f}, "
+        f"min={np.min(returns):.1f}, "
+        f"max={np.max(returns):.1f}"
+    )
+
+    return episodes_obs, episodes_actions, episodes_rewards
+
+
+def make_offline_minibatches(
+    episodes_obs,
+    episodes_actions,
+    episodes_rewards,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device,
+):
+    """
+    Build an infinite generator of minibatches from offline episodes.
+
+    Output per iteration:
+        obs:  [B, L, obs_dim]
+        actions: [B, L]          (padded with -1)
+        rtg:  [B, L, 1]          (returns-to-go)
+        ts:   [B, L]             (timesteps within episode)
+    """
+    num_episodes = len(episodes_obs)
+    assert num_episodes > 0, "No episodes in offline dataset"
+
+    obs_dim = episodes_obs[0].shape[-1]
+
+    # Precompute returns-to-go for each episode
+    episodes_rtg = []
+    episode_lengths = []
+    for rew in episodes_rewards:
+        r = np.asarray(rew, dtype=np.float32)
+        rtg = np.flip(np.cumsum(np.flip(r)))  # rtg[t] = sum_{k=t}^{T-1} r[k]
+        episodes_rtg.append(rtg)
+        episode_lengths.append(len(r))
+
+    def loader():
+        while True:
+            obs_batch = np.zeros((batch_size, seq_len, obs_dim), dtype=np.float32)
+            actions_batch = np.full((batch_size, seq_len), -1, dtype=np.int64)
+            rtg_batch = np.zeros((batch_size, seq_len, 1), dtype=np.float32)
+            ts_batch = np.zeros((batch_size, seq_len), dtype=np.int64)
+
+            for b in range(batch_size):
+                ep_idx = np.random.randint(num_episodes)
+                ep_len = episode_lengths[ep_idx]
+                if ep_len == 0:
+                    continue
+
+                # random starting index within episode
+                start = np.random.randint(0, ep_len)  # inclusive
+                end = min(ep_len, start + seq_len)
+                length = end - start
+
+                obs_batch[b, :length] = episodes_obs[ep_idx][start:end]
+                actions_batch[b, :length] = episodes_actions[ep_idx][start:end]
+
+                rtg_seq = episodes_rtg[ep_idx][start:end]
+                rtg_batch[b, :length, 0] = rtg_seq
+
+                ts_batch[b, :length] = np.arange(start, end, dtype=np.int64)
+
+            obs_t = torch.tensor(obs_batch, device=device, dtype=torch.float32)
+            actions_t = torch.tensor(actions_batch, device=device, dtype=torch.long)
+            rtg_t = torch.tensor(rtg_batch, device=device, dtype=torch.float32)
+            ts_t = torch.tensor(ts_batch, device=device, dtype=torch.long)
+            yield obs_t, actions_t, rtg_t, ts_t
+
+    return loader()
+
+
+# ====== Single-task DT training (offline) ======
+
+
 def train_single_task_dt(
     env,
     obs_shape,
@@ -41,16 +172,31 @@ def train_single_task_dt(
     device: str,
     steps: int,
     batch_size: int,
-    collect_episodes: int,
-    max_len: int = 1000,
+    dataset_root: str,
+    task_name: str,
 ):
     """
     Simple single-task training loop for CartPole (discrete actions),
-    using the same DT and data pipeline as in the continual setup,
-    but *without* any replay or multi-task logic.
+    but using OFFLINE trajectories loaded from disk (expert / mixed),
+    instead of on-policy data collection.
     """
     device_t = torch.device(device)
 
+    # 1) Load offline trajectories for this task
+    episodes_obs, episodes_actions, episodes_rewards = load_npz_dataset_for_task(
+        dataset_root, task_name
+    )
+
+    loader = make_offline_minibatches(
+        episodes_obs,
+        episodes_actions,
+        episodes_rewards,
+        seq_len=seq_len,
+        batch_size=batch_size,
+        device=device_t,
+    )
+
+    # 2) Build DT model
     model = DecisionTransformer(
         obs_shape=obs_shape,
         n_actions=n_actions,
@@ -67,24 +213,7 @@ def train_single_task_dt(
         weight_decay=1e-4,
     )
 
-    # On-policy trajectories from this env only
-    print(f"[collect] episodes={collect_episodes}, max_len={max_len}")
-    trajs = collect_trajectories(
-        env,
-        model,
-        n_episodes=collect_episodes,
-        max_len=max_len,
-        target_return=1.0,
-        device=device_t.type,
-    )
-
-    loader = make_minibatches(
-        trajs,
-        seq_len,
-        batch_size,
-        device_t.type,
-    )
-
+    # 3) Offline training from the replay buffer
     model.train()
     for step in range(steps):
         obs, actions, rtg, ts = next(loader)
@@ -118,11 +247,22 @@ def main():
     p.add_argument("--seq-len", type=int, default=20)
     p.add_argument("--episodes-eval", type=int, default=5)
     p.add_argument("--steps-per-task", type=int, default=2000)
+    # collect-episodes / max-len are no longer used (we train from offline data),
+    # but we keep the flags for backward compatibility.
     p.add_argument("--collect-episodes", type=int, default=5)
-    p.add_argument("--max-len", type=int, default=500, help="Max ep length when collecting trajs")
+    p.add_argument("--max-len", type=int, default=500, help="Max ep length when evaluating")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    # NOWE: run-dir jak w continual
+    # NEW: where expert/mixed trajectories are stored
+    p.add_argument(
+        "--dataset-root",
+        type=str,
+        default="data/cartpole_expert",
+        help="Root directory with offline trajectories per task "
+             "(e.g. output of train_cartpole_expert.py)",
+    )
+
+    # Run-dir like in continual version
     p.add_argument("--runs-root", type=str, default="runs")
     p.add_argument("--tag", type=str, default="")
 
@@ -140,7 +280,7 @@ def main():
     task_names = list(envs.keys())
     n_tasks = len(task_names)
 
-    # Run dir jak w clb-run-dt.py, ale strategy='single'
+    # Run dir like in clb-run-dt.py, but strategy='single'
     spec_tag = os.path.splitext(os.path.basename(args.spec))[0]
     run_dir = build_run_dir(
         args.runs_root,
@@ -169,8 +309,8 @@ def main():
             device=device,
             steps=args.steps_per_task,
             batch_size=64,
-            collect_episodes=args.collect_episodes,
-            max_len=args.max_len,
+            dataset_root=args.dataset_root,
+            task_name=name,
         )
 
         score = evaluate_dt(
@@ -187,9 +327,9 @@ def main():
     for name, r in results_scalar.items():
         print(f"{name}: {r:.3f}")
 
-    # ----- Zapis do runs/ w formacie kompatybilnym z CL -----
+    # ----- Save to runs/ in CL-compatible format -----
 
-    # Macierz P: tylko przekątna = single-task performance
+    # Performance matrix P: only diagonal = single-task performance
     P = np.zeros((n_tasks, n_tasks), dtype=np.float32)
     for i, name in enumerate(task_names):
         P[i, i] = float(results_scalar.get(name, 0.0))
@@ -238,7 +378,7 @@ def main():
             w.writeheader()
             w.writerows(steps)
 
-    # rez_cp.json — tak jak w CL
+    # rez_cp.json — same as in CL
     save_json(
         os.path.join(run_dir, f"rez_{bench_short(bench)}.json"),
         {"metrics": metrics, "strategy": "single"},
