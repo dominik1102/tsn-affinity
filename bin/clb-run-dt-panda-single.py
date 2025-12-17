@@ -1,21 +1,21 @@
 #!/usr/bin/env python
 from __future__ import annotations
-import argparse
-import os
-import numpy as np
 
+import os
+import csv
+import argparse
+import numpy as np
 import torch
 
 from clbench.benchmark.metrics_extra import per_step_report
 from clbench.benchmark.runner import BenchmarkResults
 from clbench.io.run_logger import bench_short, build_run_dir, save_json, save_matrix_csv
+from clbench.benchmark.metrics import StandardCLMetrics
+
 from dt.dataset import Trajectory
 from dt.dataset_panda import load_panda_offline_pkl, make_minibatches_panda
 from dt.panda_dt import PandaDecisionTransformer
 from dt.utils import evaluate_dt_panda
-
-# CL-style logging utilities
-from clbench.benchmark.metrics import StandardCLMetrics
 
 
 # Task definitions (env + dataset) – same as in clb-run-dt-panda.py
@@ -36,13 +36,20 @@ PANDA_TASKS = {
 
 
 class DummyStrategy:
-    """
-    Wrapper so we can reuse evaluate_dt_panda(strategy, env, ...),
+    """Wrapper so we can reuse evaluate_dt_panda(strategy, env, ...),
     which expects strategy.model.
     """
 
     def __init__(self, model: torch.nn.Module):
         self.model = model
+
+
+def _maybe_set_cuda_device(device_t: torch.device) -> None:
+    """If user passes e.g. --device cuda:1, make torch "current device"
+    consistent so code that uses just "cuda" doesn't silently land on cuda:0.
+    """
+    if device_t.type == "cuda" and device_t.index is not None and torch.cuda.is_available():
+        torch.cuda.set_device(device_t.index)
 
 
 def train_single_panda_task(
@@ -54,11 +61,11 @@ def train_single_panda_task(
     steps: int,
     batch_size: int,
 ):
-    """
-    Offline training for a single Panda task on its own dataset
+    """Offline training for a single Panda task on its own dataset
     (no continual, no replay).
     """
     device_t = torch.device(device)
+    _maybe_set_cuda_device(device_t)
 
     model = PandaDecisionTransformer(
         obs_dim=obs_dim,
@@ -76,6 +83,9 @@ def train_single_panda_task(
         weight_decay=1e-4,
     )
 
+    # NOTE: make_minibatches_panda historically takes device like "cpu"/"cuda".
+    # By setting torch.cuda.set_device above, "cuda" will map to the intended GPU
+    # even if device was "cuda:1".
     loader = make_minibatches_panda(
         trajs,
         seq_len=seq_len,
@@ -87,20 +97,34 @@ def train_single_panda_task(
 
     model.train()
     for step in range(steps):
-        obs, actions, rtg, ts, mask = next(loader)
+        try:
+            obs, actions, rtg, ts, mask = next(loader)
+        except StopIteration:
+            # If loader is finite, restart it.
+            loader = make_minibatches_panda(
+                trajs,
+                seq_len=seq_len,
+                batch_size=batch_size,
+                device=device_t.type,
+                act_dim=act_dim,
+                obs_dim=obs_dim,
+            )
+            obs, actions, rtg, ts, mask = next(loader)
 
         # Previous actions: shifted by one; first = zeros
         prev_actions = torch.roll(actions, shifts=1, dims=1)
         prev_actions[:, 0, :] = 0.0
 
         pred = model(obs, prev_actions, rtg, ts)  # [B, L, act_dim]
-
         mse_per_step = ((pred - actions) ** 2).mean(dim=-1)  # [B, L]
-        valid = mask.sum()
-        if valid.item() > 0:
-            loss = (mse_per_step * mask).sum() / valid
-        else:
-            loss = mse_per_step.mean()
+
+        # Avoid CPU sync via .item(); keep everything on device.
+        # If mask is all zeros, fall back to plain mean.
+        mask_f = mask.float()
+        valid = mask_f.sum()
+        numer = (mse_per_step * mask_f).sum()
+        loss_masked = numer / (valid + 1e-8)
+        loss = torch.where(valid > 0, loss_masked, mse_per_step.mean())
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -132,15 +156,18 @@ def main():
 
     args = p.parse_args()
 
-    device = args.device
-    print(f"[device] using {device}")
+    device_t = torch.device(args.device)
+    _maybe_set_cuda_device(device_t)
+
+    print(f"[device] using {device_t}")
 
     import gymnasium as gym  # panda_gym uses gymnasium API
-    import panda_gym  # ensure envs are registered
+    import panda_gym  # noqa: F401  # ensure envs are registered
 
     # ---- Run dir like in continual, but strategy="single" ----
     bench = "panda"
     bench_s = bench_short(bench)
+
     # nie mamy spec pliku, więc użyjemy prostego tagu "panda_single" (lub nadpisanego przez --tag)
     spec_tag = "panda_single"
     run_dir = build_run_dir(
@@ -153,7 +180,7 @@ def main():
 
     task_names = list(PANDA_TASKS.keys())
     n_tasks = len(task_names)
-    scores = {}
+    scores: dict[str, float] = {}
 
     for i, (name, cfg) in enumerate(PANDA_TASKS.items(), start=1):
         print("\n==============================")
@@ -169,47 +196,68 @@ def main():
         if not trajs:
             raise RuntimeError(f"No trajectories loaded from {dataset_path}")
 
-        # Infer obs_dim and act_dim from dataset
-        obs_dim = trajs[0].obs.shape[1]
-        act_dim = trajs[0].actions.shape[1]
+        # Infer obs_dim and act_dim from dataset (robust to shape variants)
+        obs_dim = trajs[0].obs.shape[-1]
+        act_dim = trajs[0].actions.shape[-1]
         print(f"[dataset] obs_dim={obs_dim}, act_dim={act_dim}, n_trajs={len(trajs)}")
 
         # Create online env for evaluation
         env = gym.make(env_id, render_mode=None)
 
-        # Train DT offline on this dataset only
-        model = train_single_panda_task(
-            trajs=trajs,
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-            seq_len=args.seq_len,
-            device=device,
-            steps=args.steps_per_task,
-            batch_size=args.batch_size,
-        )
+        model = None
+        try:
+            # Train DT offline on this dataset only
+            model = train_single_panda_task(
+                trajs=trajs,
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                seq_len=args.seq_len,
+                device=str(device_t),
+                steps=args.steps_per_task,
+                batch_size=args.batch_size,
+            )
 
-        # Evaluate policy in the real env (only on its own task)
-        score = evaluate_dt_panda(
-            DummyStrategy(model),
-            env,
-            episodes=args.episodes_eval,
-            device=device,
-        )
-        scores[name] = float(score)
-        print(f"[eval] Single-task Panda DT on {name}: {score:.3f}")
+            # Evaluate policy in the real env (only on its own task)
+            model.eval()
+            with torch.no_grad():
+                score = evaluate_dt_panda(
+                    DummyStrategy(model),
+                    env,
+                    episodes=args.episodes_eval,
+                    device=str(device_t),
+                )
+
+            scores[name] = float(score)
+            print(f"[eval] Single-task Panda DT on {name}: {score:.3f}")
+        finally:
+            # Always close the env
+            try:
+                env.close()
+            except Exception:
+                pass
+
+            # Free memory between tasks (helps when running on GPU)
+            if model is not None:
+                del model
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     print("\n=== Single-task Panda DT results ===")
     for name, sc in scores.items():
         print(f"{name}: {sc:.3f}")
 
     # ---- Build CL-style perf matrix P (diagonal = single-task performance) ----
+    # NOTE: Off-diagonal entries are set to 0.0, which may make some CL metrics
+    # (e.g., BWT/FWT) less meaningful in this single-task setting.
     P = np.zeros((n_tasks, n_tasks), dtype=np.float32)
     for i, name in enumerate(task_names):
         P[i, i] = scores.get(name, 0.0)
 
+    avg_diag = float(np.mean(np.diag(P)))
+
     # CL-style metrics object
     results_obj = BenchmarkResults(
-        name=f"DT-single-panda",
+        name="DT-single-panda",
         task_names=task_names,
         perf_matrix=P,
     )
@@ -222,8 +270,16 @@ def main():
             "name": results_obj.name,
             "task_names": task_names,
             "perf_matrix": P.tolist(),
+            "scores": scores,
+            "avg_diag": avg_diag,
             "metrics": metrics,
             "mode": "single-task",
+            "device": str(device_t),
+            "steps_per_task": args.steps_per_task,
+            "seq_len": args.seq_len,
+            "batch_size": args.batch_size,
+            "episodes_eval": args.episodes_eval,
+            "gamma": args.gamma,
         },
     )
 
@@ -235,28 +291,26 @@ def main():
     )
 
     # per_step.json / per_step.csv
-    steps = per_step_report(task_names, P)
+    steps_rep = per_step_report(task_names, P)
     save_json(
         os.path.join(run_dir, "per_step.json"),
-        {"per_step": steps},
+        {"per_step": steps_rep},
     )
-    if steps:
-        import csv
-
+    if steps_rep:
         with open(
             os.path.join(run_dir, "per_step.csv"),
             "w",
             encoding="utf-8",
             newline="",
         ) as f:
-            w = csv.DictWriter(f, fieldnames=list(steps[0].keys()))
+            w = csv.DictWriter(f, fieldnames=list(steps_rep[0].keys()))
             w.writeheader()
-            w.writerows(steps)
+            w.writerows(steps_rep)
 
     # Short summary JSON like in CL runs
     save_json(
         os.path.join(run_dir, f"rez_{bench_s}.json"),
-        {"metrics": metrics, "strategy": "single"},
+        {"metrics": metrics, "strategy": "single", "avg_diag": avg_diag},
     )
 
     print(f"\n[artifacts] saved to: {run_dir}")
