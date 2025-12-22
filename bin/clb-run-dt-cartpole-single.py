@@ -218,11 +218,11 @@ def train_single_task_dt(
     for step in range(steps):
         obs, actions, rtg, ts = next(loader)
 
-        # Previous actions = shifted by 1; first previous = padding (-1)
-        prev_actions = torch.roll(actions, shifts=1, dims=1)
-        prev_actions[:, 0] = -1
+        # # Previous actions = shifted by 1; first previous = padding (-1)
+        # prev_actions = torch.roll(actions, shifts=1, dims=1)
+        # prev_actions[:, 0] = -1
 
-        logits = model(obs, prev_actions, rtg, ts)  # [B, L, n_actions]
+        logits = model(obs, actions, rtg, ts)  # [B, L, n_actions]
 
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)),

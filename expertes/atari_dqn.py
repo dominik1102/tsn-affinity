@@ -1,10 +1,11 @@
 # clbench/experts/atari_dqn.py
 from __future__ import annotations
 
+import os
 import math
 import random
 from collections import Counter
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -81,8 +82,7 @@ def preprocess_obs(obs: np.ndarray) -> np.ndarray:
     if x.dtype != np.float32:
         x = x.astype(np.float32)
 
-    # normalize if pixel range
-    # (Using numpy max: CPU-side and cheap compared to GPU sync)
+    # normalize if pixel range (CPU-side and cheap compared to GPU sync)
     if x.size and x.max() > 1.0:
         x = x / 255.0
 
@@ -102,6 +102,11 @@ def obs_to_tensor(obs: np.ndarray, device: torch.device) -> torch.Tensor:
     """
     x = np.ascontiguousarray(obs)
     return torch.as_tensor(x, dtype=torch.float32, device=device).unsqueeze(0)
+
+
+def _state_dict_cpu(module: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Return a CPU-cloned state_dict (safe to keep as 'best' without holding GPU memory)."""
+    return {k: v.detach().cpu().clone() for k, v in module.state_dict().items()}
 
 
 # =============================================================================
@@ -151,7 +156,7 @@ class AtariQNetwork(nn.Module):
 
 
 # =============================================================================
-# Replay buffer (IMPORTANT FIX: store images as uint8 to save RAM and speed up)
+# Replay buffer (stores images as uint8 to save RAM and speed up)
 # =============================================================================
 
 class ReplayBufferAtari:
@@ -176,13 +181,10 @@ class ReplayBufferAtari:
 
     @staticmethod
     def _to_uint8(x: np.ndarray) -> np.ndarray:
-        """
-        Accepts either float32 [0,1] or uint8 [0,255] and returns uint8 [0,255].
-        """
+        """Accepts either float32 [0,1] or uint8 [0,255] and returns uint8 [0,255]."""
         x = np.asarray(x)
         if x.dtype == np.uint8:
             return x
-        # assume float32 [0,1]
         x = np.clip(x * 255.0, 0.0, 255.0).astype(np.uint8)
         return x
 
@@ -199,9 +201,7 @@ class ReplayBufferAtari:
             self.full = True
 
     def sample(self, batch_size: int, device: torch.device):
-        """
-        Sample a batch of transitions and return tensors on the given device.
-        """
+        """Sample a batch of transitions and return tensors on the given device."""
         max_idx = self.size()
         idxs = np.random.randint(0, max_idx, size=int(batch_size))
 
@@ -220,7 +220,15 @@ class ReplayBufferAtari:
 # =============================================================================
 
 @torch.no_grad()
-def eval_greedy(env, q_net, device, episodes=5, max_len=10_000, fire_reset: bool = True, return_hist: bool = True):
+def eval_greedy(
+    env,
+    q_net: nn.Module,
+    device: torch.device,
+    episodes: int = 5,
+    max_len: int = 10_000,
+    fire_reset: bool = True,
+    return_hist: bool = True,
+):
     q_net.eval()
     rets = []
     hist = Counter()
@@ -249,7 +257,7 @@ def eval_greedy(env, q_net, device, episodes=5, max_len=10_000, fire_reset: bool
 
 
 # =============================================================================
-# Atari DQN expert training
+# Atari DQN expert training (MASTER: keeps/saves BEST + Double DQN)
 # =============================================================================
 
 def train_atari_dqn_expert(
@@ -271,17 +279,30 @@ def train_atari_dqn_expert(
     fire_reset: bool = True,
     reward_clip: bool = False,
     debug: bool = True,
+    # -------- MASTER additions --------
+    save_best_path: Optional[str] = None,
+    save_last_path: Optional[str] = None,
+    best_on: str = "eval_avg",          # "eval_avg" | "eval_best" | "train_episode" | "auto"
+    restore_best_at_end: bool = True,
+    eval_episodes: int = 20,            # more stable than 5 for selecting "master"
+    eval_max_len: int = 20_000,         # allow full games in eval (especially Pong)
+    stop_when_eval_avg_ge: Optional[float] = None,  # early stop criterion (optional)
 ):
     """
     Train a DQN expert on a single Atari task.
 
-    Key fixes included:
-      - Replay buffer stores uint8 frames (avoids huge RAM usage and slowdowns)
-      - obs_to_tensor no longer uses x.max().item() (avoids GPU sync)
-      - obs_shape taken from PREPROCESSED observation (prevents HWC/CHW mismatch)
-      - epsilon schedule decays after warmup (more standard)
-      - optional FIRE reset helper for games requiring it
+    MASTER behavior:
+      - Tracks BEST weights (CPU snapshot) and can save them to disk
+      - Can restore BEST weights before returning, so trajectory collection uses BEST
+      - Uses Double DQN target (usually more stable and better than vanilla DQN)
+      - Eval defaults are more stable (eval_episodes=20, longer eval_max_len)
     """
+
+    def _ensure_parent_dir(path: str) -> None:
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+
     # Use real preprocessed observation shape (important if env gives HWC)
     obs = reset_env_processed(env, fire_reset=fire_reset)
     obs_shape = obs.shape
@@ -299,11 +320,59 @@ def train_atari_dqn_expert(
         print("[debug] obs shape:", obs.shape, "dtype:", obs.dtype, "min/max:", float(obs.min()), float(obs.max()))
         print("[debug] env obs_space:", getattr(env.observation_space, "shape", None), "actions:", n_actions)
 
+    # -------- BEST tracking --------
+    if best_on == "auto":
+        best_on_eff = "eval_avg" if (eval_every and int(eval_every) > 0) else "train_episode"
+    else:
+        best_on_eff = best_on
+
+    if best_on_eff in ("eval_avg", "eval_best") and not (eval_every and int(eval_every) > 0):
+        if debug:
+            print(f"[warn] best_on='{best_on_eff}' but eval_every=0 -> falling back to best_on='train_episode'")
+        best_on_eff = "train_episode"
+
+    best_score = -float("inf")
+    best_step = -1
+    best_state_dict_cpu: Optional[Dict[str, torch.Tensor]] = None
+
+    best_train_episode_return = -float("inf")
+
+    def _maybe_update_best(score: float, step_i: int, reason: str) -> None:
+        nonlocal best_score, best_step, best_state_dict_cpu
+        if score > best_score + 1e-8:
+            best_score = float(score)
+            best_step = int(step_i)
+            best_state_dict_cpu = _state_dict_cpu(q_net)
+
+            if save_best_path:
+                _ensure_parent_dir(save_best_path)
+                torch.save(
+                    {
+                        "kind": "best",
+                        "best_on": best_on_eff,
+                        "score": best_score,
+                        "step": best_step,
+                        "obs_shape": tuple(obs_shape),
+                        "n_actions": int(n_actions),
+                        "state_dict": best_state_dict_cpu,
+                    },
+                    save_best_path,
+                )
+                print(
+                    f"[checkpoint] saved BEST ({best_on_eff}) score={best_score:.2f} "
+                    f"step={best_step} reason={reason} -> {save_best_path}"
+                )
+            else:
+                print(f"[checkpoint] updated BEST ({best_on_eff}) score={best_score:.2f} step={best_step} reason={reason}")
+
     episode_return = 0.0
-    all_returns = []
-    best_return = -float("inf")
+    all_returns: List[float] = []
+
+    last_step = 0
 
     for step in range(1, int(total_steps) + 1):
+        last_step = step
+
         # Epsilon schedule (decay starts after warmup)
         t = max(0, step - int(warmup_steps))
         eps = eps_end + (eps_start - eps_end) * math.exp(-t / float(eps_decay))
@@ -315,9 +384,24 @@ def train_atari_dqn_expert(
         if eval_every and (step % int(eval_every) == 0):
             e_env = eval_env if eval_env is not None else env
             avg_eval, best_eval, hist = eval_greedy(
-                e_env, q_net, device, episodes=5, fire_reset=fire_reset, return_hist=True
+                e_env,
+                q_net,
+                device,
+                episodes=int(eval_episodes),
+                max_len=int(eval_max_len),
+                fire_reset=fire_reset,
+                return_hist=True,
             )
-            print(f"[eval greedy] step={step} avg={avg_eval:.1f} best={best_eval:.1f} hist={hist}")
+            print(f"[eval greedy] step={step} avg={avg_eval:.2f} best={best_eval:.2f} hist={hist}")
+
+            if best_on_eff == "eval_avg":
+                _maybe_update_best(avg_eval, step, reason="eval_avg")
+            elif best_on_eff == "eval_best":
+                _maybe_update_best(best_eval, step, reason="eval_best")
+
+            if stop_when_eval_avg_ge is not None and avg_eval >= float(stop_when_eval_avg_ge):
+                print(f"[stop] reached avg_eval={avg_eval:.2f} >= {float(stop_when_eval_avg_ge):.2f} at step={step}")
+                break
 
             if (eval_env is None) and resync_after_eval:
                 obs = reset_env_processed(env, fire_reset=fire_reset)
@@ -354,8 +438,13 @@ def train_atari_dqn_expert(
             batch_obs, batch_actions, batch_rewards, batch_next_obs, batch_dones = replay.sample(batch_size, device)
 
             q_values = q_net(batch_obs).gather(1, batch_actions.unsqueeze(1)).squeeze(1)
+
+            # Double DQN target:
+            # - action selection by online net (q_net)
+            # - action evaluation by target net (target_net)
             with torch.no_grad():
-                next_q_values = target_net(batch_next_obs).max(dim=1)[0]
+                next_actions = q_net(batch_next_obs).argmax(dim=1)
+                next_q_values = target_net(batch_next_obs).gather(1, next_actions.unsqueeze(1)).squeeze(1)
                 target_q = batch_rewards + gamma * (1.0 - batch_dones) * next_q_values
 
             loss = F.smooth_l1_loss(q_values, target_q)
@@ -375,21 +464,59 @@ def train_atari_dqn_expert(
         if step % int(target_update_every) == 0:
             target_net.load_state_dict(q_net.state_dict())
 
+        # Episode ended
         if done:
-            all_returns.append(episode_return)
-            best_return = max(best_return, episode_return)
+            all_returns.append(float(episode_return))
+            best_train_episode_return = max(best_train_episode_return, float(episode_return))
+
+            if best_on_eff == "train_episode":
+                _maybe_update_best(float(episode_return), step, reason="train_episode")
 
             if len(all_returns) % 10 == 0:
                 avg_last10 = float(np.mean(all_returns[-10:]))
                 print(
                     f"[DQN expert Atari] steps={step}, episodes={len(all_returns)}, "
-                    f"avg_return(last10)={avg_last10:.1f}, best={best_return:.1f}, eps={eps:.3f}"
+                    f"avg_return(last10)={avg_last10:.2f}, best_train_ep={best_train_episode_return:.2f}, eps={eps:.3f}"
                 )
 
             episode_return = 0.0
             obs = reset_env_processed(env, fire_reset=fire_reset)
 
-    print(f"[DQN expert Atari] finished training, best_return={best_return:.1f}")
+    # Save LAST checkpoint (optional)
+    if save_last_path:
+        _ensure_parent_dir(save_last_path)
+        torch.save(
+            {
+                "kind": "last",
+                "step": int(last_step),
+                "obs_shape": tuple(obs_shape),
+                "n_actions": int(n_actions),
+                "state_dict": _state_dict_cpu(q_net),
+            },
+            save_last_path,
+        )
+        print(f"[checkpoint] saved LAST -> {save_last_path}")
+
+    # Restore BEST into q_net before returning (recommended for master trajectory collection)
+    if restore_best_at_end and best_state_dict_cpu is not None:
+        q_net.load_state_dict(best_state_dict_cpu)
+        target_net.load_state_dict(q_net.state_dict())
+
+    print(
+        f"[DQN expert Atari] finished training. "
+        f"best_train_ep={best_train_episode_return:.2f}. "
+        f"best({best_on_eff})={best_score:.2f} at step={best_step}"
+    )
+
+    # Attach info for downstream saving / debugging (optional)
+    try:
+        q_net.best_on = best_on_eff
+        q_net.best_score = float(best_score)
+        q_net.best_step = int(best_step)
+        q_net.best_state_dict_cpu = best_state_dict_cpu
+    except Exception:
+        pass
+
     return q_net
 
 
@@ -413,10 +540,16 @@ def collect_atari_expert_trajectories(
       - with probability `expert_action_prob` we use the expert (greedy Q-network),
       - otherwise we sample a random action.
 
-    Returns float32 observations in [0,1], CHW (compatible with your old pipeline).
+    Observations are stored as float32 CHW in [0,1] (as produced by preprocess_obs()).
+
+    IMPORTANT NOTE:
+      If many episodes hit `max_len` without done=True, your returns are truncated.
+      For Pong "master" datasets, increase `max_len` substantially (e.g., 20000+).
     """
     expert_action_prob = float(np.clip(expert_action_prob, 0.0, 1.0))
     trajectories: List[Dict[str, Any]] = []
+
+    hit_limit_count = 0
 
     for ep in range(int(n_episodes)):
         obs = reset_env_processed(env, fire_reset=fire_reset)
@@ -452,18 +585,32 @@ def collect_atari_expert_trajectories(
             if done:
                 break
 
+        # Count truncations (hit max_len without done=True)
+        hit_limit = (len(obs_buf) >= int(max_len)) and (len(done_buf) == 0 or done_buf[-1] is False)
+        if hit_limit:
+            hit_limit_count += 1
+
         traj = {
             "observations": np.stack(obs_buf, axis=0),       # [T, C, H, W] float32
             "actions": np.array(act_buf, dtype=np.int64),    # [T]
-            "rewards": np.array(rew_buf, dtype=np.float32),
-            "dones": np.array(done_buf, dtype=np.bool_),
+            "rewards": np.array(rew_buf, dtype=np.float32),  # [T]
+            "dones": np.array(done_buf, dtype=np.bool_),     # [T]
         }
         trajectories.append(traj)
 
         print(
             f"[collect Atari expert-mix] episode {ep+1}/{n_episodes}, "
-            f"return={ep_return:.1f}, T={len(obs_buf)}, expert_action_prob={expert_action_prob:.2f}"
+            f"return={ep_return:.2f}, T={len(obs_buf)}, expert_action_prob={expert_action_prob:.2f}"
         )
+
+    if n_episodes > 0:
+        frac = hit_limit_count / float(n_episodes)
+        print(f"[collect summary] hit_max_len_without_done: {hit_limit_count}/{n_episodes} ({frac*100:.1f}%)")
+        if frac > 0.2:
+            print(
+                "[warn] Many episodes hit max_len without done=True. Returns are truncated. "
+                "Increase --max-len (e.g. 20000/50000) or check if the env has a strict TimeLimit wrapper."
+            )
 
     return trajectories
 
@@ -476,12 +623,16 @@ def save_trajectories_npz(trajectories: List[Dict[str, Any]], out_path: str) -> 
     """
     Save multiple episodes into a single .npz file.
 
+    IMPORTANT: This uses a concatenated representation:
+      - observations/actions/rewards/dones are concatenated over time across episodes
+      - episode_lengths stores the per-episode T so you can reconstruct boundaries
+
     Stored keys:
-      - observations:    [N, C, H, W]
-      - actions:         [N]
-      - rewards:         [N]
-      - dones:           [N]
-      - episode_lengths: [n_episodes]
+      - observations:     [sum_T, C, H, W]
+      - actions:          [sum_T]
+      - rewards:          [sum_T]
+      - dones:            [sum_T]
+      - episode_lengths:  [n_episodes]
     """
     obs_list = [tr["observations"] for tr in trajectories]
     act_list = [tr["actions"] for tr in trajectories]

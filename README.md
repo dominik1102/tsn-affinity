@@ -79,13 +79,13 @@ and report per-task performance. Useful as an “upper bound” / reference for 
 
 ```bash
 # Single-task DT for each task in the spec (works for CartPole or Atari)
-python bin/clb-run-dt-cartpole-single.py --spec specs_cp.json --dataset-root data/cartpole_expert --seq-len 20 --steps-per-task 50000 --episodes-eval 5 --device cuda
+python bin/clb-run-dt-cartpole-single.py --spec configs/specs_cp.json --dataset-root data/cartpole_expert --seq-len 20 --steps-per-task 50000 --episodes-eval 5 --device cuda
 ```
 
 For Atari just change the spec:
 
 ```bash
-python bin/clb-run-dt-atari-single.py   --spec specs_atari.json   --steps 20000   --max-ep-len 1000   --seq-len 20   --collect-episodes 5   --episodes-eval 10   --device cuda
+python bin/clb-run-dt-atari-single.py --spec configs/specs_atari_minari_like.json --steps 20000 --seq-len 20 --episodes-eval 10 --max-ep-len 50000 --device cuda --min-episode-return 0
 ```
 
 #### Panda (continuous, offline datasets)
@@ -148,7 +148,7 @@ trajectories into your DT training pipeline (similar to existing robot datasets)
 
 
 ```bash
-python bin/train_atari_expert.py   --spec specs_atari.json   --episodes-per-task 200   --max-len 1000   --total-steps-expert 5000000  --out-dir data/atari_expert   --device cuda   --expert-action-prob 1
+python bin/train_atari_expert.py   --spec specs_atari.json   --episodes-per-task 200   --max-len 20000   --total-steps-expert 5000000  --out-dir data/atari_expert   --device cuda   --expert-action-prob 1
 ```
 
 
@@ -196,4 +196,15 @@ Panda (example; path depends on timestamp and strategy):
 python analyze_runs.py --run-dir runs/20251122-151458/panda/cumulative/panda3
 ```
 
+---
+Inspect atari expert trajectories (visualize frames + stats):
+```bash
+python tools/inspect_atari_trajs.py --root resources/atari_expert --tasks A_Pong B_Breakout C_Seaquest
+```
+
+---
+Generate Atari expert dataset in DT `.npz` format from Minari:
+```bash
+python bin/generate_atari_traj_from_mintari.py --config configs/specs_atari.json --out-root resources/atari_expert --max-len 50000 --obs-dtype float32
+```
 ---

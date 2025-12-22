@@ -37,6 +37,7 @@ TaskRegistry.register("atari", AtariAdapter())
 
 
 def main():
+
     p = argparse.ArgumentParser()
     p.add_argument("--spec", required=True, help="Atari spec file, e.g. specs_atari.json")
 
@@ -112,7 +113,8 @@ def main():
         env_id = getattr(getattr(env, "spec", None), "id", None)
         print(f"[Atari Expert] task={name}, env_id={env_id}")
         print("======================================")
-
+        task_dir = os.path.join(args.out_dir, name)
+        os.makedirs(task_dir, exist_ok=True)
         # Separate env for eval (so eval doesn't perturb training env)
         eval_env = AtariAdapter().create_env(spec_by_name[name])
 
@@ -129,6 +131,10 @@ def main():
                 # NOTE: do NOT set reward_clip=True if your adapter already clips rewards,
                 # unless you intentionally want double clipping.
                 reward_clip=False,
+                save_best_path=os.path.join(task_dir, "expert_best.pt"),
+                save_last_path=os.path.join(task_dir, "expert_last.pt"),
+                best_on="eval_avg",  # recommended for "master"
+                restore_best_at_end=True,  # so collection uses BEST automatically
             )
         finally:
             try:

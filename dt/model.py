@@ -1,83 +1,95 @@
 from __future__ import annotations
+
 import math
 from dataclasses import dataclass
+from typing import Optional, List, Union
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
+import torch.nn.functional as F
 
 
-# ============================================================
-# 1. Auxiliary layers (LayerNorm, Attention, Block)
-#    – this is your "nanoGPT-style" part
-# ============================================================
+# =============================================================================
+# Transformer building blocks (nanoGPT-style)
+# =============================================================================
 
 class LayerNorm(nn.Module):
-    """LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False"""
+    """LayerNorm with optional bias (PyTorch LayerNorm always has bias)."""
 
-    def __init__(self, ndim, bias: bool):
+    def __init__(self, ndim: int, bias: bool):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
         self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, self.weight.shape, self.weight, self.bias, 1e-5)
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, n_embd, n_head, dropout, bias, block_size):
+    """
+    Multi-head causal self-attention with an optional token validity mask.
+
+    token_mask: bool [B, T] where True means "token exists".
+    We apply it as a KEY mask (padded tokens can't be attended),
+    combined with a causal (lower-triangular) mask.
+    """
+
+    def __init__(self, n_embd: int, n_head: int, dropout: float, bias: bool, block_size: int):
         super().__init__()
-        assert n_embd % n_head == 0
-        # key, query, value projections for all heads, but in a batch
+        assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
+
+        self.n_head = int(n_head)
+        self.n_embd = int(n_embd)
+        self.dropout = float(dropout)
+
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
-        # output projection
         self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
-        # regularization
+
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
-        self.n_head = n_head
-        self.n_embd = n_embd
-        self.dropout = dropout
-        # flash attention
-        self.flash = hasattr(F, "scaled_dot_product_attention")
-        if not self.flash:
-            print(
-                "WARNING: using slow attention. Consider installing Flash Attention for faster training"
-            )
 
-        # causal mask (T x T)
+        # causal mask [1,1,block,block]
         self.register_buffer(
-            "bias",
-            torch.tril(torch.ones(block_size, block_size, dtype=torch.bool)).view(
-                1, 1, block_size, block_size
-            ),
+            "causal",
+            torch.tril(torch.ones(block_size, block_size, dtype=torch.bool)).view(1, 1, block_size, block_size),
+            persistent=False,
         )
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, T, C = x.size()
+        self.flash = hasattr(F, "scaled_dot_product_attention")
 
-        # q, k, v
+    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        x: [B, T, C]
+        token_mask: bool [B, T] (True = valid token)
+        """
+        B, T, C = x.shape
+        head_dim = C // self.n_head
+
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
 
-        # attn_mask [B, T] -> [B,1,1,T] and combine with causal bias
-        if attn_mask is not None:
-            attn_mask = attn_mask.view(B, 1, 1, T)
-            attn_mask = attn_mask & self.bias[:, :, :T, :T]
+        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)  # [B, nh, T, hs]
+        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+
+        causal = self.causal[:, :, :T, :T]  # [1,1,T,T]
+
+        if token_mask is None:
+            keep = causal.expand(B, 1, T, T)
         else:
-            attn_mask = self.bias[:, :, :T, :T]
+            token_mask = token_mask.to(dtype=torch.bool)
+            key_keep = token_mask.view(B, 1, 1, T)  # [B,1,1,T]
+            keep = (key_keep & causal).expand(B, 1, T, T)  # [B,1,T,T]
 
         if self.flash:
-            # Flash attention expects additive mask
-            float_mask = torch.zeros(B, 1, 1, T, device=attn_mask.device)
-            float_mask = float_mask.masked_fill(~attn_mask, -10000.0)
+            # additive mask: 0 for keep, -inf for masked
+            attn_bias = torch.zeros((B, 1, T, T), device=x.device, dtype=torch.float32)
+            attn_bias = attn_bias.masked_fill(~keep, -1e4)
             dropout_p = self.dropout if self.training else 0.0
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=float_mask, dropout_p=dropout_p)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=dropout_p)
         else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(~attn_mask, -10000.0)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))  # [B,nh,T,T]
+            att = att.masked_fill(~keep, -1e4)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v
@@ -88,120 +100,95 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, n_embd, bias, dropout):
+    def __init__(self, n_embd: int, bias: bool, dropout: float):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd, bias=bias)
-        self.gelu = nn.GELU()
-        self.c_proj = nn.Linear(4 * n_embd, n_embd, bias=bias)
-        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(n_embd, 4 * n_embd, bias=bias)
+        self.proj = nn.Linear(4 * n_embd, n_embd, bias=bias)
+        self.drop = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        x = self.fc(x)
+        x = F.gelu(x)
+        x = self.proj(x)
+        x = self.drop(x)
         return x
 
 
 class Block(nn.Module):
-    def __init__(self, n_embd, n_head, dropout, bias, block_size):
+    def __init__(self, n_embd: int, n_head: int, dropout: float, bias: bool, block_size: int):
         super().__init__()
-        self.ln_1 = LayerNorm(n_embd, bias=bias)
+        self.ln1 = LayerNorm(n_embd, bias=bias)
         self.attn = CausalSelfAttention(n_embd, n_head, dropout, bias, block_size)
-        self.ln_2 = LayerNorm(n_embd, bias=bias)
+        self.ln2 = LayerNorm(n_embd, bias=bias)
         self.mlp = MLP(n_embd, bias, dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None) -> torch.Tensor:
-        x = x + self.attn(self.ln_1(x), attn_mask)
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), token_mask=token_mask)
+        x = x + self.mlp(self.ln2(x))
         return x
 
 
-# ============================================================
-# 2. Configuration and "bare" DT backbone (without observation encoding)
-# ============================================================
+# =============================================================================
+# DT backbone
+# =============================================================================
 
 @dataclass
 class DecisionTransformerConfig:
+    # transformer
     n_layer: int = 3
-    n_head: int = 1
+    n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.1
     bias: bool = False
-    K: int = 20                  # context length in timesteps
-    max_ep_len: int = 1000       # for time embedding
-    state_dim: int = 17
-    act_dim: int = 6
-    act_discrete: bool = False
-    act_vocab_size: int = 1
-    act_tanh: bool = False
-    tanh_embeddings: bool = False
+
+    # DT specifics
+    K: int = 20
+    max_ep_len: int = 10000
+    state_dim: int = 128
+    act_vocab_size: int = 6
 
 
 class DTBackbone(nn.Module):
     """
-    Your original Decision Transformer (Karpathy-style),
-    just under a new name so it doesn't conflict with the RL wrapper.
+    Discrete-action DT backbone over interleaved tokens:
+        (R_1, s_1, a_1, R_2, s_2, a_2, ...)
+
+    Predict actions from STATE token positions: logits at s_t predict a_t.
+    Dzięki temu: state token s_t NIE widzi a_t (bo a_t jest "w przyszłości").
     """
 
-    def __init__(self, config: DecisionTransformerConfig):
+    def __init__(self, cfg: DecisionTransformerConfig):
         super().__init__()
-        self.config = config
-        print(f"DTBackbone config: {config}")
+        self.cfg = cfg
+        print(f"DTBackbone config: {cfg}")
 
-        block_size = config.K * 3  # each block is composed of 3 tokens: R, s, a
-        self.transformer = nn.ModuleDict(
-            dict(
-                te=nn.Embedding(config.max_ep_len, config.n_embd),
-                re=nn.Linear(1, config.n_embd),
-                se=nn.Linear(config.state_dim, config.n_embd),
-                ae=(
-                    nn.Embedding(config.act_vocab_size, config.n_embd)
-                    if config.act_discrete
-                    else nn.Linear(config.act_dim, config.n_embd)
-                ),
-                drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList(
-                    [
-                        Block(
-                            config.n_embd,
-                            config.n_head,
-                            config.dropout,
-                            config.bias,
-                            block_size,
-                        )
-                        for _ in range(config.n_layer)
-                    ]
-                ),
-                ln_f=LayerNorm(config.n_embd, bias=config.bias),
-                ln_e=LayerNorm(config.n_embd, bias=config.bias),
-            )
+        block_size = cfg.K * 3
+
+        self.te = nn.Embedding(cfg.max_ep_len, cfg.n_embd)
+        self.re = nn.Linear(1, cfg.n_embd, bias=cfg.bias)
+        self.se = nn.Linear(cfg.state_dim, cfg.n_embd, bias=cfg.bias)
+        self.ae = nn.Embedding(cfg.act_vocab_size, cfg.n_embd)
+
+        self.drop = nn.Dropout(cfg.dropout)
+        self.h = nn.ModuleList(
+            [Block(cfg.n_embd, cfg.n_head, cfg.dropout, cfg.bias, block_size) for _ in range(cfg.n_layer)]
         )
+        self.ln_f = LayerNorm(cfg.n_embd, bias=cfg.bias)
+        self.ln_e = LayerNorm(cfg.n_embd, bias=cfg.bias)
 
-        if config.act_discrete:
-            self.act_head = nn.Linear(config.n_embd, config.act_vocab_size)
-        else:
-            self.act_head = nn.Linear(config.n_embd, config.act_dim)
+        self.act_head = nn.Linear(cfg.n_embd, cfg.act_vocab_size, bias=True)
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
             if pn.endswith("c_proj.weight"):
-                torch.nn.init.normal_(
-                    p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer)
-                )
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * cfg.n_layer))
 
-        print("DTBackbone parameters: %.2fM" % (self.get_num_params() / 1e6,))
+        print("DTBackbone parameters: %.2fM" % (self.num_parameters() / 1e6))
 
-    def get_num_params(self, non_embedding=True):
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.te.weight.numel()
-            n_params -= self.transformer.se.weight.numel()
-            n_params -= self.transformer.ae.weight.numel()
-            n_params -= self.transformer.re.weight.numel()
-        return n_params
+    def num_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters())
 
-    def _init_weights(self, module):
+    def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -211,153 +198,109 @@ class DTBackbone(nn.Module):
 
     def forward(
         self,
-        states: torch.Tensor,   # [B, T, state_dim]
-        actions: torch.Tensor,  # [B, T] for discrete or [B, T, act_dim]
-        rtgs: torch.Tensor,     # [B, T, 1]
-        tsteps: torch.Tensor,   # [B, T]
-        attn_mask: torch.Tensor | None = None,  # [B, T] bool
-        targets: torch.Tensor | None = None,    # for loss (discrete: [B, T])
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        device = states.device
-        b, t = states.shape[0], states.shape[1]
-        assert t <= self.config.K, f"Cannot forward sequence of length {t}, K is only {self.config.K}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device)  # [t] (unused but OK)
+        states: torch.Tensor,                           # [B, T, state_dim]
+        actions: torch.Tensor,                          # [B, T] int64 (dummy ok for last)
+        rtgs: torch.Tensor,                             # [B, T, 1]
+        timesteps: torch.Tensor,                        # [B, T] int64
+        attention_mask: Optional[torch.Tensor] = None,   # [B, T] bool
+    ) -> torch.Tensor:
+        B, T, _ = states.shape
+        assert T <= self.cfg.K, f"T={T} exceeds context K={self.cfg.K}"
 
-        # embeddings
-        state_emb = self.transformer.se(states)  # [B, T, n_embd]
-        if self.config.act_discrete:
-            # actions: [B, T] of ints
-            action_emb = self.transformer.ae(actions.long())
+        timesteps = timesteps.clamp_(0, self.cfg.max_ep_len - 1)
+        t_emb = self.te(timesteps)  # [B,T,C]
+
+        s_emb = self.se(states) + t_emb
+        a_emb = self.ae(actions) + t_emb
+        r_emb = self.re(rtgs) + t_emb
+
+        # tokens: [R_1, s_1, a_1, R_2, s_2, a_2, ...]
+        x = torch.stack((r_emb, s_emb, a_emb), dim=1)                # [B,3,T,C]
+        x = x.permute(0, 2, 1, 3).reshape(B, 3 * T, self.cfg.n_embd)  # [B,3T,C]
+        x = self.ln_e(x)
+
+        if attention_mask is None:
+            attention_mask = torch.ones((B, T), dtype=torch.bool, device=states.device)
         else:
-            action_emb = self.transformer.ae(actions)
+            attention_mask = attention_mask.to(dtype=torch.bool, device=states.device)
 
-        rtg_emb = self.transformer.re(rtgs)      # [B, T, n_embd]
-        tstep_emb = self.transformer.te(tsteps)  # [B, T, n_embd]
+        token_mask = torch.stack((attention_mask, attention_mask, attention_mask), dim=1)  # [B,3,T]
+        token_mask = token_mask.permute(0, 2, 1).reshape(B, 3 * T)                         # [B,3T]
 
-        if self.config.tanh_embeddings:
-            state_emb = torch.tanh(state_emb)
-            action_emb = torch.tanh(action_emb)
-            rtg_emb = torch.tanh(rtg_emb)
+        x = self.drop(x)
+        for block in self.h:
+            x = block(x, token_mask=token_mask)
+        x = self.ln_f(x)
 
-        state_emb = state_emb + tstep_emb
-        action_emb = action_emb + tstep_emb
-        rtg_emb = rtg_emb + tstep_emb
-
-        # [R_1, s_1, a_1, R_2, s_2, a_2, ...]
-        stacked_emb = (
-            torch.stack((rtg_emb, state_emb, action_emb), dim=1)
-            .permute(0, 2, 1, 3)
-            .reshape(b, 3 * t, self.config.n_embd)
-        )
-        stacked_emb = self.transformer.ln_e(stacked_emb)
-
-        if attn_mask is None:
-            attn_mask = torch.ones(b, t, dtype=torch.bool, device=device)
-        stacked_attn_mask = (
-            torch.stack((attn_mask, attn_mask, attn_mask), dim=1)
-            .permute(0, 2, 1)
-            .reshape(b, 3 * t)
-        )
-
-        x = self.transformer.drop(stacked_emb)
-        for block in self.transformer.h:
-            x = block(x, stacked_attn_mask)
-        x = self.transformer.ln_f(x)
-
-        if targets is not None:
-            # training path: full logits for all timesteps
-            logits = self.act_head(x)
-            if self.config.act_tanh:
-                logits = torch.tanh(logits)
-            logits = logits[:, 1::3, :]  # state positions
-            if self.config.act_discrete:
-                loss = F.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    targets.view(-1),
-                    ignore_index=-1,
-                )
-            else:
-                act_dim = logits.shape[2]
-                logits_ = logits.reshape(-1, act_dim)[attn_mask.reshape(-1) > 0]
-                targets_ = targets.reshape(-1, act_dim)[attn_mask.reshape(-1) > 0]
-                loss = F.mse_loss(logits_, targets_)
-        else:
-            # inference path: only the last action
-            logits = self.act_head(x[:, [-2], :])
-            if self.config.act_tanh:
-                logits = torch.tanh(logits)
-            loss = None
-
-        return logits, loss
+        logits_all = self.act_head(x)     # [B,3T,A]
+        logits = logits_all[:, 1::3, :]   # state tokens -> [B,T,A]
+        return logits
 
 
-# ============================================================
-# 3. ObsEncoder
-# ============================================================
+# =============================================================================
+# Observation encoder
+# =============================================================================
 
 class ObsEncoder(nn.Module):
-    """
-    Encodes observations into a d_model-sized embedding.
-
-    - For vector observations (shape [D]), uses an MLP.
-    - For image observations (shape [C, H, W]), uses a small CNN + linear head.
-    """
+    """Encodes observations into d_model (vector MLP or Atari CNN)."""
 
     def __init__(self, obs_shape, d_model: int):
         super().__init__()
-        if len(obs_shape) == 1:
-            # Vector observations
+        self.obs_shape = tuple(obs_shape)
+        self.d_model = int(d_model)
+
+        if len(self.obs_shape) == 1:
             self.kind = "mlp"
-            self.enc = nn.Sequential(
-                nn.Linear(obs_shape[0], d_model),
+            self.mlp = nn.Sequential(
+                nn.Linear(self.obs_shape[0], d_model),
                 nn.GELU(),
+                nn.LayerNorm(d_model),
+            )
+        elif len(self.obs_shape) == 3:
+            self.kind = "cnn"
+            c, h, w = self.obs_shape
+            # DQN-ish CNN (ReLU działa stabilnie na Atari)
+            self.cnn = nn.Sequential(
+                nn.Conv2d(c, 32, kernel_size=8, stride=4),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=4, stride=2),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=1),
+                nn.ReLU(),
+            )
+            with torch.no_grad():
+                dummy = torch.zeros(1, c, h, w)
+                z = self.cnn(dummy)
+                flat = int(z.view(1, -1).shape[1])
+            self.proj = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(flat, d_model),
+                nn.ReLU(),
                 nn.LayerNorm(d_model),
             )
         else:
-            # Image observations
-            self.kind = "cnn"
-            c, h, w = obs_shape
-            self.enc = nn.Sequential(
-                nn.Conv2d(c, 32, 8, stride=4),
-                nn.GELU(),
-                nn.Conv2d(32, 64, 4, stride=2),
-                nn.GELU(),
-                nn.Conv2d(64, 64, 3, stride=1),
-                nn.GELU(),
-                nn.Flatten(),
-            )
-            with torch.no_grad():
-                dummy = torch.zeros(1, *obs_shape)
-                out = self.enc[:-1](dummy)
-                flat = out.view(1, -1).size(1)
-            self.proj = nn.Sequential(
-                nn.Linear(flat, d_model),
-                nn.GELU(),
-                nn.LayerNorm(d_model),
-            )
+            raise ValueError(f"Unsupported obs_shape={self.obs_shape}. Expected [D] or [C,H,W].")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.kind == "mlp":
-            return self.enc(x)
-        z = self.enc(x)
-        z = z.view(z.size(0), -1)
-        return self.proj(z)
+            return self.mlp(x)
+        z = self.cnn(x)
+        z = self.proj(z)
+        return z
 
 
-# ============================================================
-# 4. RL wrapper: DecisionTransformer
-#     – this class has the same interface as before,
-#       but internally it uses DTBackbone.
-# ============================================================
+# =============================================================================
+# Public wrapper
+# =============================================================================
 
 class DecisionTransformer(nn.Module):
     """
-    Decision Transformer for discrete-action environments (CartPole, Atari).
+    Discrete-action Decision Transformer wrapper:
 
-    This wrapper:
-      - encodes observations (vector / image) into dimension d_model,
-      - maps them to 'states' for DTBackbone,
-      - uses your DT implementation to predict actions.
+      obs -> ObsEncoder -> DTBackbone -> action logits
+
+    forward(): offline training
+    act(): online rollout with rolling context
     """
 
     def __init__(
@@ -369,183 +312,203 @@ class DecisionTransformer(nn.Module):
         n_heads: int = 4,
         seq_len: int = 20,
         p_drop: float = 0.1,
-        max_ep_len: int = 2048,  # formerly embed_t.num_embeddings
+        max_ep_len: int = 10000,
     ):
         super().__init__()
-        self.seq_len = seq_len
-        self.d_model = d_model
-        self.n_actions = n_actions
-        self.max_ep_len = max_ep_len
+        self.seq_len = int(seq_len)
+        self.n_actions = int(n_actions)
+        self.max_ep_len = int(max_ep_len)
 
-        # Observation encoder (vector or image)
         self.obs_enc = ObsEncoder(obs_shape, d_model)
 
-        # DTBackbone configuration (discrete actions)
-        config = DecisionTransformerConfig(
-            n_layer=n_layers,
-            n_head=n_heads,
-            n_embd=d_model,
-            dropout=p_drop,
+        cfg = DecisionTransformerConfig(
+            n_layer=int(n_layers),
+            n_head=int(n_heads),
+            n_embd=int(d_model),
+            dropout=float(p_drop),
             bias=False,
-            K=seq_len,
-            max_ep_len=max_ep_len,
-            state_dim=d_model,          # state = observation embedding
-            act_dim=1,                  # unused when act_discrete=True
-            act_discrete=True,
-            act_vocab_size=n_actions,
-            act_tanh=False,
-            tanh_embeddings=False,
+            K=int(seq_len),
+            max_ep_len=int(max_ep_len),
+            state_dim=int(d_model),
+            act_vocab_size=int(n_actions),
         )
-        self.dt = DTBackbone(config)
+        self.dt = DTBackbone(cfg)
 
-        # History buffers for act()
         self.reset_history()
 
-    # ----------------- Forward (training) ---------------------
+    # ----------------------------- normalization -----------------------------
+
+    @staticmethod
+    def _normalize_obs_np(obs: np.ndarray) -> np.ndarray:
+        if obs.dtype == np.uint8:
+            return obs.astype(np.float32) / 255.0
+        x = obs.astype(np.float32, copy=False)
+        if x.size > 0 and float(np.max(x)) > 1.5:
+            x = x / 255.0
+        return x
+
+    @staticmethod
+    def _normalize_obs_tensor(obs: torch.Tensor) -> torch.Tensor:
+        if obs.dtype == torch.uint8:
+            return obs.float() / 255.0
+        x = obs.float()
+        if x.numel() > 0 and float(x.max().item()) > 1.5:
+            x = x / 255.0
+        return x
+
+    # ----------------------------- offline forward -----------------------------
+
     def forward(
         self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        rtg: torch.Tensor,
-        timesteps: torch.Tensor,
+        obs: torch.Tensor,                            # [B,L,C,H,W] or [B,L,D]
+        actions: torch.Tensor,                        # [B,L] (padded -1)
+        rtg: torch.Tensor,                            # [B,L,1]
+        timesteps: torch.Tensor,                      # [B,L]
+        attention_mask: Optional[torch.Tensor] = None  # [B,L] bool
     ) -> torch.Tensor:
-        """
-        Args:
-            obs:       [B, L, D] or [B, L, C, H, W]
-            actions:   [B, L] (with -1 as padding)
-            rtg:       [B, L, 1]
-            timesteps: [B, L]
-
-        Returns:
-            logits: [B, L, n_actions]
-        """
         B, L = actions.shape
         device = obs.device
 
-        # --- encode observations -> states [B, L, d_model] ---
+        # normalize
         if obs.dim() == 5:
-            # Images: [B, L, C, H, W] -> [B*L, C, H, W]
-            B, L, C, H, W = obs.shape
-            obs_flat = obs.view(B * L, C, H, W)
-            s_tok = self.obs_enc(obs_flat).view(B, L, -1)
+            obs = self._normalize_obs_tensor(obs)
+        elif obs.dim() == 3:
+            obs = obs.float()
         else:
-            # Vectors: [B, L, D]
-            obs_flat = obs.view(B * L, -1)
-            s_tok = self.obs_enc(obs_flat).view(B, L, -1)
+            raise ValueError(f"Unexpected obs shape: {tuple(obs.shape)}")
 
-        # --- actions: clamp -1 -> 0 for embeddings, but targets remain -1 ---
-        actions = actions.to(device)
+        # encode obs -> states [B,L,d_model]
+        if obs.dim() == 5:
+            _, _, C, H, W = obs.shape
+            obs_flat = obs.view(B * L, C, H, W)
+            s = self.obs_enc(obs_flat).view(B, L, -1)
+        else:
+            obs_flat = obs.view(B * L, -1)
+            s = self.obs_enc(obs_flat).view(B, L, -1)
+
+        actions = actions.to(device=device, dtype=torch.long)
         actions_for_embed = torch.clamp(actions, min=0)
 
-        # --- rtg and timesteps ---
-        rtg = rtg.to(device)
-        timesteps = timesteps.to(device).long()
-        timesteps = torch.clamp(timesteps, max=self.max_ep_len - 1)
+        timesteps = timesteps.to(device=device, dtype=torch.long).clamp_(0, self.max_ep_len - 1)
+        rtg = rtg.to(device=device, dtype=torch.float32)
 
-        # attention mask – currently full (no special padding mask)
-        attn_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+        if attention_mask is None:
+            attention_mask = torch.ones((B, L), dtype=torch.bool, device=device)
+        else:
+            attention_mask = attention_mask.to(device=device, dtype=torch.bool)
 
-        # call DTBackbone in "training" mode to get logits for all L
-        logits, _ = self.dt(
-            states=s_tok,
+        logits = self.dt(
+            states=s,
             actions=actions_for_embed,
             rtgs=rtg,
-            tsteps=timesteps,
-            attn_mask=attn_mask,
-            targets=actions,   # CE inside will use ignore_index=-1, but we ignore the returned loss
+            timesteps=timesteps,
+            attention_mask=attention_mask,
         )
-        # logits: [B, L, n_actions]
         return logits
 
-    # ========================================================
-    # 5. History management & act() – almost unchanged
-    # ========================================================
+    # ----------------------------- rollout API -----------------------------
 
-    def reset_history(self):
-        """Reset internal history buffers used by act()."""
-        self._hist_obs: list[torch.Tensor] = []
-        self._hist_actions: list[int] = []
+    def reset_history(self) -> None:
+        self._hist_obs: List[torch.Tensor] = []
+        self._hist_actions: List[int] = []
+        self._hist_rtgs: List[float] = []
+        self._hist_t: List[int] = []
+
+    def _trim_history(self) -> None:
+        if len(self._hist_obs) <= self.seq_len:
+            return
+        overflow = len(self._hist_obs) - self.seq_len
+        self._hist_obs = self._hist_obs[overflow:]
+        self._hist_rtgs = self._hist_rtgs[overflow:]
+        self._hist_t = self._hist_t[overflow:]
+        if overflow > 0 and len(self._hist_actions) > 0:
+            self._hist_actions = self._hist_actions[overflow:]
+        if len(self._hist_actions) > self.seq_len - 1:
+            self._hist_actions = self._hist_actions[-(self.seq_len - 1):]
+
+    def prime_history(self, obs, action: int, rtg_scalar: float, t: int) -> None:
+        """
+        Dodaj (state, action) do historii bez odpalania policy.
+        Przydaje się jeśli wymuszasz FIRE po reset.
+        """
+        device_t = next(self.parameters()).device
+
+        if isinstance(obs, torch.Tensor):
+            obs_t = self._normalize_obs_tensor(obs.to(device_t))
+        else:
+            obs_arr = self._normalize_obs_np(np.asarray(obs))
+            obs_t = torch.from_numpy(obs_arr).to(device_t, dtype=torch.float32)
+
+        if obs_t.dim() not in (1, 3):
+            raise ValueError(f"prime_history: unsupported obs shape {tuple(obs_t.shape)}")
+
+        self._hist_obs.append(obs_t)
+        self._hist_rtgs.append(float(rtg_scalar))
+        self._hist_t.append(int(t))
+        self._trim_history()
+
+        self._hist_actions.append(int(action))
+        if len(self._hist_actions) > self.seq_len:
+            self._hist_actions = self._hist_actions[-self.seq_len:]
 
     @torch.no_grad()
     def act(
         self,
-        obs,
+        obs: Union[np.ndarray, torch.Tensor, List[float]],
         rtg_scalar: float,
         t: int,
-        prev_action: int,
-        device: str = "cpu",
-        n_actions: int | None = None,
+        prev_action: int = 0,   # kompatybilność
+        device: str = "cpu",    # kompatybilność
+        n_actions: Optional[int] = None,
     ) -> int:
-        """
-        Greedy action selection with a rolling context of up to `seq_len` steps.
-        """
         self.eval()
+        device_t = next(self.parameters()).device
 
-        # 1) real device taken from model parameters
-        param_device = next(self.parameters()).device
-        device = torch.device(param_device)
-
-        # 2) obs -> tensor on the proper device
-        if isinstance(obs, (list, tuple)):
-            obs_t = torch.tensor(obs, dtype=torch.float32, device=device)
-        elif isinstance(obs, torch.Tensor):
-            obs_t = obs.to(device=device, dtype=torch.float32)
+        if isinstance(obs, torch.Tensor):
+            obs_t = self._normalize_obs_tensor(obs.to(device_t))
         else:
-            obs_arr = np.asarray(obs, dtype=np.float32)
-            obs_t = torch.from_numpy(obs_arr).to(device=device)
+            obs_arr = self._normalize_obs_np(np.asarray(obs))
+            obs_t = torch.from_numpy(obs_arr).to(device_t, dtype=torch.float32)
 
-        # ---- update history ----
+        if obs_t.dim() not in (1, 3):
+            raise ValueError(f"act(): unsupported obs shape {tuple(obs_t.shape)}")
+
+        # append current state
         self._hist_obs.append(obs_t)
-        if len(self._hist_obs) > self.seq_len:
-            self._hist_obs.pop(0)
-            if len(self._hist_actions) > 0:
-                self._hist_actions.pop(0)
+        self._hist_rtgs.append(float(rtg_scalar))
+        self._hist_t.append(int(t))
+        self._trim_history()
 
         L = len(self._hist_obs)
-        dummy_action = -1
-        actions_list = list(self._hist_actions) + [dummy_action]
-        assert len(actions_list) == L
 
-        actions = torch.tensor(
-            actions_list, dtype=torch.long, device=device
-        ).unsqueeze(0)  # [1, L]
-        rtg = torch.full(
-            (1, L, 1), float(rtg_scalar), dtype=torch.float32, device=device
-        )
+        # past actions (for states 1..L-1)
+        past = self._hist_actions[-(L - 1):] if L > 1 else []
+        actions_seq = past + [0]  # dummy for current step (state token doesn't see it)
 
-        # timesteps [1, L]
-        start_t = max(0, t - L + 1)
-        t_seq = torch.arange(
-            start_t, start_t + L, dtype=torch.long, device=device
-        ).unsqueeze(0)
-        t_seq = torch.clamp(t_seq, max=self.max_ep_len - 1)
+        if len(actions_seq) != L:
+            actions_seq = (actions_seq + [0] * L)[:L]
 
-        # Build observation batch: [1, L, ...]
+        actions_t = torch.tensor(actions_seq, device=device_t, dtype=torch.long).unsqueeze(0)  # [1,L]
+        rtg_t = torch.tensor(self._hist_rtgs, device=device_t, dtype=torch.float32).view(1, L, 1)
+        ts_t = torch.tensor(self._hist_t, device=device_t, dtype=torch.long).clamp_(0, self.max_ep_len - 1).view(1, L)
+        mask_t = torch.ones((1, L), device=device_t, dtype=torch.bool)
+
         if obs_t.dim() == 1:
-            obs_batch = torch.stack(self._hist_obs, dim=0).unsqueeze(0)  # [1, L, D]
-        elif obs_t.dim() == 3:
-            obs_batch = torch.stack(self._hist_obs, dim=0).unsqueeze(0)  # [1, L, C,H,W]
+            obs_batch = torch.stack(self._hist_obs, dim=0).unsqueeze(0)  # [1,L,D]
         else:
-            raise ValueError(f"Unsupported obs shape for act(): {obs_t.shape}")
+            obs_batch = torch.stack(self._hist_obs, dim=0).unsqueeze(0)  # [1,L,C,H,W]
 
-        # ---- forward ----
-        logits = self.forward(obs_batch, actions, rtg, t_seq)  # [1, L, n_actions]
+        logits = self.forward(obs_batch, actions_t, rtg_t, ts_t, attention_mask=mask_t)  # [1,L,A]
         logits_last = logits[:, -1, :]
 
         if n_actions is not None:
-            n_model = logits_last.shape[-1]
-            if n_actions > n_model:
-                raise ValueError(
-                    f"Requested n_actions={n_actions}, but model head has only {n_model}"
-                )
             logits_last = logits_last.clone()
-            logits_last[..., n_actions:] = -1e9
+            logits_last[..., int(n_actions):] = -1e9
 
         action = int(torch.argmax(logits_last, dim=-1).item())
 
-        # update history
         self._hist_actions.append(action)
         if len(self._hist_actions) > self.seq_len:
-            self._hist_actions.pop(0)
+            self._hist_actions = self._hist_actions[-self.seq_len:]
 
         return action
