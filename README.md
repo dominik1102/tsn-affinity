@@ -85,8 +85,8 @@ python bin/clb-run-dt-cartpole-single.py --spec configs/specs_cp.json --dataset-
 For Atari just change the spec:
 
 ```bash
-python bin/clb-run-dt-atari-single.py --spec configs/specs_atari_minari_like.json --steps 20000 --seq-len 20 --episodes-eval 10 --max-ep-len 50000 --device cuda --min-episode-return 0
-```
+python bin/clb-run-dt-atari-single.py --spec configs/specs_atari.json --dataset-root resources/atari_expert --steps 20000 --seq-len 20 --batch-size 64 --episodes-eval 10 --max-ep-len 27000 --device cuda --debug-replay
+ ```
 
 #### Panda (continuous, offline datasets)
 

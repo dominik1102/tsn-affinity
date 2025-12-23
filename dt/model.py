@@ -10,13 +10,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# =============================================================================
-# Transformer building blocks (nanoGPT-style)
-# =============================================================================
+# ============================================================
+# Transformer blocks (GPT-style, causal)
+# ============================================================
 
 class LayerNorm(nn.Module):
     """LayerNorm with optional bias (PyTorch LayerNorm always has bias)."""
-
     def __init__(self, ndim: int, bias: bool):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(ndim))
@@ -27,21 +26,13 @@ class LayerNorm(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    """
-    Multi-head causal self-attention with an optional token validity mask.
-
-    token_mask: bool [B, T] where True means "token exists".
-    We apply it as a KEY mask (padded tokens can't be attended),
-    combined with a causal (lower-triangular) mask.
-    """
-
     def __init__(self, n_embd: int, n_head: int, dropout: float, bias: bool, block_size: int):
         super().__init__()
         assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
 
-        self.n_head = int(n_head)
-        self.n_embd = int(n_embd)
-        self.dropout = float(dropout)
+        self.n_head = n_head
+        self.head_dim = n_embd // n_head
+        self.dropout = dropout
 
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=bias)
         self.c_proj = nn.Linear(n_embd, n_embd, bias=bias)
@@ -49,50 +40,63 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.resid_dropout = nn.Dropout(dropout)
 
-        # causal mask [1,1,block,block]
+        # for manual attention fallback
         self.register_buffer(
             "causal",
             torch.tril(torch.ones(block_size, block_size, dtype=torch.bool)).view(1, 1, block_size, block_size),
             persistent=False,
         )
 
-        self.flash = hasattr(F, "scaled_dot_product_attention")
+        self.has_sdp = hasattr(F, "scaled_dot_product_attention")
 
-    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         x: [B, T, C]
-        token_mask: bool [B, T] (True = valid token)
+        attn_mask: bool [B, T] where True=keep token (key padding mask)
         """
         B, T, C = x.shape
-        head_dim = C // self.n_head
 
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = self.c_attn(x).split(C, dim=-1)  # each [B,T,C]
 
-        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)  # [B, nh, T, hs]
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        # -> [B, nh, T, hs]
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        causal = self.causal[:, :, :T, :T]  # [1,1,T,T]
+        dropout_p = self.dropout if self.training else 0.0
 
-        if token_mask is None:
-            keep = causal.expand(B, 1, T, T)
+        if self.has_sdp:
+            # scaled_dot_product_attention supports is_causal=True
+            # We pass key padding mask as attn_mask broadcastable to [B, nh, T, T].
+            float_mask = None
+            if attn_mask is not None:
+                if attn_mask.dim() != 2:
+                    raise ValueError(f"attn_mask must be [B,T] bool, got {attn_mask.shape}")
+                keep = attn_mask[:, None, None, :]  # [B,1,1,T]
+                float_mask = torch.zeros((B, 1, 1, T), device=x.device, dtype=q.dtype)
+                float_mask = float_mask.masked_fill(~keep, float("-inf"))
+
+            y = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=float_mask,
+                dropout_p=dropout_p,
+                is_causal=True,
+            )
         else:
-            token_mask = token_mask.to(dtype=torch.bool)
-            key_keep = token_mask.view(B, 1, 1, T)  # [B,1,1,T]
-            keep = (key_keep & causal).expand(B, 1, T, T)  # [B,1,T,T]
+            # manual attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))  # [B,nh,T,T]
+            causal = self.causal[:, :, :T, :T]  # [1,1,T,T]
 
-        if self.flash:
-            # additive mask: 0 for keep, -inf for masked
-            attn_bias = torch.zeros((B, 1, T, T), device=x.device, dtype=torch.float32)
-            attn_bias = attn_bias.masked_fill(~keep, -1e4)
-            dropout_p = self.dropout if self.training else 0.0
-            y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias, dropout_p=dropout_p)
-        else:
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))  # [B,nh,T,T]
+            if attn_mask is not None:
+                keep = attn_mask[:, None, None, :]  # [B,1,1,T]
+                keep = keep & causal                # -> [B,1,T,T]
+            else:
+                keep = causal
+
             att = att.masked_fill(~keep, -1e4)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v
+            y = att @ v  # [B,nh,T,hs]
 
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
@@ -122,26 +126,24 @@ class Block(nn.Module):
         self.ln2 = LayerNorm(n_embd, bias=bias)
         self.mlp = MLP(n_embd, bias, dropout)
 
-    def forward(self, x: torch.Tensor, token_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        x = x + self.attn(self.ln1(x), token_mask=token_mask)
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.ln2(x))
         return x
 
 
-# =============================================================================
-# DT backbone
-# =============================================================================
+# ============================================================
+# Decision Transformer backbone
+# ============================================================
 
 @dataclass
-class DecisionTransformerConfig:
-    # transformer
+class DTConfig:
     n_layer: int = 3
     n_head: int = 4
     n_embd: int = 128
     dropout: float = 0.1
     bias: bool = False
 
-    # DT specifics
     K: int = 20
     max_ep_len: int = 10000
     state_dim: int = 128
@@ -150,14 +152,10 @@ class DecisionTransformerConfig:
 
 class DTBackbone(nn.Module):
     """
-    Discrete-action DT backbone over interleaved tokens:
-        (R_1, s_1, a_1, R_2, s_2, a_2, ...)
-
-    Predict actions from STATE token positions: logits at s_t predict a_t.
-    Dzięki temu: state token s_t NIE widzi a_t (bo a_t jest "w przyszłości").
+    Tokens: (R_0, s_0, a_0, R_1, s_1, a_1, ...)
+    Predict action logits at state token positions => [B, T, A]
     """
-
-    def __init__(self, cfg: DecisionTransformerConfig):
+    def __init__(self, cfg: DTConfig):
         super().__init__()
         self.cfg = cfg
         print(f"DTBackbone config: {cfg}")
@@ -170,9 +168,7 @@ class DTBackbone(nn.Module):
         self.ae = nn.Embedding(cfg.act_vocab_size, cfg.n_embd)
 
         self.drop = nn.Dropout(cfg.dropout)
-        self.h = nn.ModuleList(
-            [Block(cfg.n_embd, cfg.n_head, cfg.dropout, cfg.bias, block_size) for _ in range(cfg.n_layer)]
-        )
+        self.h = nn.ModuleList([Block(cfg.n_embd, cfg.n_head, cfg.dropout, cfg.bias, block_size) for _ in range(cfg.n_layer)])
         self.ln_f = LayerNorm(cfg.n_embd, bias=cfg.bias)
         self.ln_e = LayerNorm(cfg.n_embd, bias=cfg.bias)
 
@@ -198,52 +194,49 @@ class DTBackbone(nn.Module):
 
     def forward(
         self,
-        states: torch.Tensor,                           # [B, T, state_dim]
-        actions: torch.Tensor,                          # [B, T] int64 (dummy ok for last)
-        rtgs: torch.Tensor,                             # [B, T, 1]
-        timesteps: torch.Tensor,                        # [B, T] int64
-        attention_mask: Optional[torch.Tensor] = None,   # [B, T] bool
+        states: torch.Tensor,                 # [B,T,state_dim]
+        actions: torch.Tensor,                # [B,T] int64 (already clamped >=0)
+        rtgs: torch.Tensor,                   # [B,T,1]
+        timesteps: torch.Tensor,              # [B,T] int64
+        attention_mask: Optional[torch.Tensor] = None,  # [B,T] bool
     ) -> torch.Tensor:
         B, T, _ = states.shape
-        assert T <= self.cfg.K, f"T={T} exceeds context K={self.cfg.K}"
+        if T > self.cfg.K:
+            raise ValueError(f"T={T} exceeds K={self.cfg.K}")
 
-        timesteps = timesteps.clamp_(0, self.cfg.max_ep_len - 1)
-        t_emb = self.te(timesteps)  # [B,T,C]
+        timesteps = torch.clamp(timesteps, 0, self.cfg.max_ep_len - 1)
+        t_emb = self.te(timesteps)  # [B,T,E]
 
         s_emb = self.se(states) + t_emb
         a_emb = self.ae(actions) + t_emb
         r_emb = self.re(rtgs) + t_emb
 
-        # tokens: [R_1, s_1, a_1, R_2, s_2, a_2, ...]
-        x = torch.stack((r_emb, s_emb, a_emb), dim=1)                # [B,3,T,C]
-        x = x.permute(0, 2, 1, 3).reshape(B, 3 * T, self.cfg.n_embd)  # [B,3T,C]
+        # interleave => [B, 3T, E]
+        x = torch.stack((r_emb, s_emb, a_emb), dim=2)      # [B,T,3,E]
+        x = x.reshape(B, 3 * T, self.cfg.n_embd)
         x = self.ln_e(x)
 
         if attention_mask is None:
             attention_mask = torch.ones((B, T), dtype=torch.bool, device=states.device)
-        else:
-            attention_mask = attention_mask.to(dtype=torch.bool, device=states.device)
 
-        token_mask = torch.stack((attention_mask, attention_mask, attention_mask), dim=1)  # [B,3,T]
-        token_mask = token_mask.permute(0, 2, 1).reshape(B, 3 * T)                         # [B,3T]
+        # token mask => [B, 3T]
+        tok_mask = attention_mask[:, :, None].expand(B, T, 3).reshape(B, 3 * T)
 
         x = self.drop(x)
         for block in self.h:
-            x = block(x, token_mask=token_mask)
+            x = block(x, attn_mask=tok_mask)
         x = self.ln_f(x)
 
-        logits_all = self.act_head(x)     # [B,3T,A]
-        logits = logits_all[:, 1::3, :]   # state tokens -> [B,T,A]
+        logits_all = self.act_head(x)       # [B,3T,A]
+        logits = logits_all[:, 1::3, :]     # state tokens => [B,T,A]
         return logits
 
 
-# =============================================================================
-# Observation encoder
-# =============================================================================
+# ============================================================
+# Obs encoder
+# ============================================================
 
 class ObsEncoder(nn.Module):
-    """Encodes observations into d_model (vector MLP or Atari CNN)."""
-
     def __init__(self, obs_shape, d_model: int):
         super().__init__()
         self.obs_shape = tuple(obs_shape)
@@ -251,7 +244,7 @@ class ObsEncoder(nn.Module):
 
         if len(self.obs_shape) == 1:
             self.kind = "mlp"
-            self.mlp = nn.Sequential(
+            self.net = nn.Sequential(
                 nn.Linear(self.obs_shape[0], d_model),
                 nn.GELU(),
                 nn.LayerNorm(d_model),
@@ -259,14 +252,13 @@ class ObsEncoder(nn.Module):
         elif len(self.obs_shape) == 3:
             self.kind = "cnn"
             c, h, w = self.obs_shape
-            # DQN-ish CNN (ReLU działa stabilnie na Atari)
             self.cnn = nn.Sequential(
                 nn.Conv2d(c, 32, kernel_size=8, stride=4),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Conv2d(32, 64, kernel_size=4, stride=2),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.Conv2d(64, 64, kernel_size=3, stride=1),
-                nn.ReLU(),
+                nn.GELU(),
             )
             with torch.no_grad():
                 dummy = torch.zeros(1, c, h, w)
@@ -275,34 +267,24 @@ class ObsEncoder(nn.Module):
             self.proj = nn.Sequential(
                 nn.Flatten(),
                 nn.Linear(flat, d_model),
-                nn.ReLU(),
+                nn.GELU(),
                 nn.LayerNorm(d_model),
             )
         else:
-            raise ValueError(f"Unsupported obs_shape={self.obs_shape}. Expected [D] or [C,H,W].")
+            raise ValueError(f"Unsupported obs_shape={self.obs_shape}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.kind == "mlp":
-            return self.mlp(x)
+            return self.net(x)
         z = self.cnn(x)
-        z = self.proj(z)
-        return z
+        return self.proj(z)
 
 
-# =============================================================================
-# Public wrapper
-# =============================================================================
+# ============================================================
+# Public DT model
+# ============================================================
 
 class DecisionTransformer(nn.Module):
-    """
-    Discrete-action Decision Transformer wrapper:
-
-      obs -> ObsEncoder -> DTBackbone -> action logits
-
-    forward(): offline training
-    act(): online rollout with rolling context
-    """
-
     def __init__(
         self,
         obs_shape,
@@ -321,7 +303,7 @@ class DecisionTransformer(nn.Module):
 
         self.obs_enc = ObsEncoder(obs_shape, d_model)
 
-        cfg = DecisionTransformerConfig(
+        cfg = DTConfig(
             n_layer=int(n_layers),
             n_head=int(n_heads),
             n_embd=int(d_model),
@@ -336,60 +318,35 @@ class DecisionTransformer(nn.Module):
 
         self.reset_history()
 
-    # ----------------------------- normalization -----------------------------
-
-    @staticmethod
-    def _normalize_obs_np(obs: np.ndarray) -> np.ndarray:
-        if obs.dtype == np.uint8:
-            return obs.astype(np.float32) / 255.0
-        x = obs.astype(np.float32, copy=False)
-        if x.size > 0 and float(np.max(x)) > 1.5:
-            x = x / 255.0
-        return x
-
-    @staticmethod
-    def _normalize_obs_tensor(obs: torch.Tensor) -> torch.Tensor:
-        if obs.dtype == torch.uint8:
-            return obs.float() / 255.0
-        x = obs.float()
-        if x.numel() > 0 and float(x.max().item()) > 1.5:
-            x = x / 255.0
-        return x
-
-    # ----------------------------- offline forward -----------------------------
-
     def forward(
         self,
-        obs: torch.Tensor,                            # [B,L,C,H,W] or [B,L,D]
-        actions: torch.Tensor,                        # [B,L] (padded -1)
-        rtg: torch.Tensor,                            # [B,L,1]
-        timesteps: torch.Tensor,                      # [B,L]
-        attention_mask: Optional[torch.Tensor] = None  # [B,L] bool
+        obs: torch.Tensor,                      # [B,L,C,H,W] or [B,L,D]
+        actions: torch.Tensor,                  # [B,L] with -1 padding allowed
+        rtg: torch.Tensor,                      # [B,L,1]
+        timesteps: torch.Tensor,                # [B,L]
+        attention_mask: Optional[torch.Tensor] = None,  # [B,L] bool
     ) -> torch.Tensor:
         B, L = actions.shape
         device = obs.device
 
-        # normalize
+        # Encode observations => states [B,L,d_model]
         if obs.dim() == 5:
-            obs = self._normalize_obs_tensor(obs)
-        elif obs.dim() == 3:
-            obs = obs.float()
-        else:
-            raise ValueError(f"Unexpected obs shape: {tuple(obs.shape)}")
-
-        # encode obs -> states [B,L,d_model]
-        if obs.dim() == 5:
-            _, _, C, H, W = obs.shape
+            B2, L2, C, H, W = obs.shape
+            assert B2 == B and L2 == L
             obs_flat = obs.view(B * L, C, H, W)
             s = self.obs_enc(obs_flat).view(B, L, -1)
-        else:
+        elif obs.dim() == 3:
             obs_flat = obs.view(B * L, -1)
             s = self.obs_enc(obs_flat).view(B, L, -1)
+        else:
+            raise ValueError(f"Unexpected obs shape: {obs.shape}")
 
         actions = actions.to(device=device, dtype=torch.long)
         actions_for_embed = torch.clamp(actions, min=0)
 
-        timesteps = timesteps.to(device=device, dtype=torch.long).clamp_(0, self.max_ep_len - 1)
+        timesteps = timesteps.to(device=device, dtype=torch.long)
+        timesteps = torch.clamp(timesteps, 0, self.max_ep_len - 1)
+
         rtg = rtg.to(device=device, dtype=torch.float32)
 
         if attention_mask is None:
@@ -406,91 +363,67 @@ class DecisionTransformer(nn.Module):
         )
         return logits
 
-    # ----------------------------- rollout API -----------------------------
-
+    # ------------------------
+    # Inference history
+    # ------------------------
     def reset_history(self) -> None:
         self._hist_obs: List[torch.Tensor] = []
         self._hist_actions: List[int] = []
         self._hist_rtgs: List[float] = []
         self._hist_t: List[int] = []
 
-    def _trim_history(self) -> None:
-        if len(self._hist_obs) <= self.seq_len:
-            return
-        overflow = len(self._hist_obs) - self.seq_len
-        self._hist_obs = self._hist_obs[overflow:]
-        self._hist_rtgs = self._hist_rtgs[overflow:]
-        self._hist_t = self._hist_t[overflow:]
-        if overflow > 0 and len(self._hist_actions) > 0:
-            self._hist_actions = self._hist_actions[overflow:]
-        if len(self._hist_actions) > self.seq_len - 1:
-            self._hist_actions = self._hist_actions[-(self.seq_len - 1):]
-
-    def prime_history(self, obs, action: int, rtg_scalar: float, t: int) -> None:
-        """
-        Dodaj (state, action) do historii bez odpalania policy.
-        Przydaje się jeśli wymuszasz FIRE po reset.
-        """
-        device_t = next(self.parameters()).device
-
+    @staticmethod
+    def _to_tensor_obs(obs: Union[np.ndarray, torch.Tensor], device: torch.device) -> torch.Tensor:
         if isinstance(obs, torch.Tensor):
-            obs_t = self._normalize_obs_tensor(obs.to(device_t))
+            x = obs.to(device=device, dtype=torch.float32)
         else:
-            obs_arr = self._normalize_obs_np(np.asarray(obs))
-            obs_t = torch.from_numpy(obs_arr).to(device_t, dtype=torch.float32)
+            x = torch.from_numpy(np.asarray(obs)).to(device=device, dtype=torch.float32)
 
-        if obs_t.dim() not in (1, 3):
-            raise ValueError(f"prime_history: unsupported obs shape {tuple(obs_t.shape)}")
-
-        self._hist_obs.append(obs_t)
-        self._hist_rtgs.append(float(rtg_scalar))
-        self._hist_t.append(int(t))
-        self._trim_history()
-
-        self._hist_actions.append(int(action))
-        if len(self._hist_actions) > self.seq_len:
-            self._hist_actions = self._hist_actions[-self.seq_len:]
+        # If looks like 0..255, normalize
+        if x.numel() > 0 and float(x.max().item()) > 1.5:
+            x = x / 255.0
+        return x
 
     @torch.no_grad()
     def act(
         self,
-        obs: Union[np.ndarray, torch.Tensor, List[float]],
+        obs: Union[np.ndarray, torch.Tensor],  # CHW float in [0,1] (or uint8)
         rtg_scalar: float,
         t: int,
-        prev_action: int = 0,   # kompatybilność
-        device: str = "cpu",    # kompatybilność
+        device: str = "cpu",
         n_actions: Optional[int] = None,
     ) -> int:
         self.eval()
         device_t = next(self.parameters()).device
 
-        if isinstance(obs, torch.Tensor):
-            obs_t = self._normalize_obs_tensor(obs.to(device_t))
-        else:
-            obs_arr = self._normalize_obs_np(np.asarray(obs))
-            obs_t = torch.from_numpy(obs_arr).to(device_t, dtype=torch.float32)
-
+        obs_t = self._to_tensor_obs(obs, device_t)
         if obs_t.dim() not in (1, 3):
-            raise ValueError(f"act(): unsupported obs shape {tuple(obs_t.shape)}")
+            raise ValueError(f"act(): expected obs dim 1 or 3, got {tuple(obs_t.shape)}")
 
-        # append current state
         self._hist_obs.append(obs_t)
         self._hist_rtgs.append(float(rtg_scalar))
         self._hist_t.append(int(t))
-        self._trim_history()
+
+        # keep last K
+        while len(self._hist_obs) > self.seq_len:
+            self._hist_obs.pop(0)
+            self._hist_rtgs.pop(0)
+            self._hist_t.pop(0)
+            if self._hist_actions:
+                self._hist_actions.pop(0)
 
         L = len(self._hist_obs)
 
-        # past actions (for states 1..L-1)
-        past = self._hist_actions[-(L - 1):] if L > 1 else []
-        actions_seq = past + [0]  # dummy for current step (state token doesn't see it)
-
-        if len(actions_seq) != L:
-            actions_seq = (actions_seq + [0] * L)[:L]
+        # actions sequence = past actions + dummy for current step
+        past = list(self._hist_actions)
+        if len(past) > L - 1:
+            past = past[-(L - 1):]
+        actions_seq = past + [0]
+        assert len(actions_seq) == L
 
         actions_t = torch.tensor(actions_seq, device=device_t, dtype=torch.long).unsqueeze(0)  # [1,L]
         rtg_t = torch.tensor(self._hist_rtgs, device=device_t, dtype=torch.float32).view(1, L, 1)
-        ts_t = torch.tensor(self._hist_t, device=device_t, dtype=torch.long).clamp_(0, self.max_ep_len - 1).view(1, L)
+        ts_t = torch.tensor(self._hist_t, device=device_t, dtype=torch.long).view(1, L)
         mask_t = torch.ones((1, L), device=device_t, dtype=torch.bool)
 
         if obs_t.dim() == 1:
@@ -508,7 +441,7 @@ class DecisionTransformer(nn.Module):
         action = int(torch.argmax(logits_last, dim=-1).item())
 
         self._hist_actions.append(action)
-        if len(self._hist_actions) > self.seq_len:
-            self._hist_actions = self._hist_actions[-self.seq_len:]
+        while len(self._hist_actions) > self.seq_len:
+            self._hist_actions.pop(0)
 
         return action

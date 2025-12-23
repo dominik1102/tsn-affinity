@@ -1,53 +1,5 @@
 [
-  {
-    "name": "A_Pong",
-    "env_id": null,
-    "seed": 0,
-    "params": {
-      "game": "ALE/Pong-v5",
-      "frameskip": 4,
-      "noop_max": 30,
-      "sticky_actions": true,
-      "repeat_action_prob": 0.25,
-      "grayscale_obs": true,
-      "scale_obs": false,
-      "terminal_on_life_loss": true,
-      "clip_rewards": true,
-      "frame_stack": 4
-    }
-  },
-  {
-    "name": "B_Breakout",
-    "env_id": null,
-    "seed": 1,
-    "params": {
-      "game": "ALE/Breakout-v5",
-      "frameskip": 4,
-      "noop_max": 30,
-      "sticky_actions": true,
-      "repeat_action_prob": 0.25,
-      "grayscale_obs": true,
-      "scale_obs": false,
-      "terminal_on_life_loss": true,
-      "clip_rewards": true,
-      "frame_stack": 4
-    }
-  },
-  {
-    "name": "C_Seaquest",
-    "env_id": null,
-    "seed": 2,
-    "params": {
-      "game": "ALE/Seaquest-v5",
-      "frameskip": 4,
-      "noop_max": 30,
-      "sticky_actions": true,
-      "repeat_action_prob": 0.25,
-      "grayscale_obs": true,
-      "scale_obs": false,
-      "terminal_on_life_loss": true,
-      "clip_rewards": true,
-      "frame_stack": 4
-    }
-  }
+  { "name": "A_Pong",     "seed": 0, "params": { "game": "ALE/Pong-v5",     "frame_stack": 4, "clip_rewards": true } },
+  { "name": "B_Breakout", "seed": 1, "params": { "game": "ALE/Breakout-v5", "frame_stack": 4, "clip_rewards": true } },
+  { "name": "C_Seaquest", "seed": 2, "params": { "game": "ALE/Seaquest-v5", "frame_stack": 4, "clip_rewards": true } }
 ]
