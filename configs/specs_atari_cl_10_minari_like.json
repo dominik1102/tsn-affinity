@@ -1,0 +1,172 @@
+[
+  {
+    "name": "A_Alien",
+    "env_id": null,
+    "seed": 0,
+    "params": {
+      "game": "ALE/Alien-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "B_Atlantis",
+    "env_id": null,
+    "seed": 1,
+    "params": {
+      "game": "ALE/Atlantis-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "C_Boxing",
+    "env_id": null,
+    "seed": 2,
+    "params": {
+      "game": "ALE/Boxing-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "D_Breakout",
+    "env_id": null,
+    "seed": 3,
+    "params": {
+      "game": "ALE/Breakout-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "E_Centipede",
+    "env_id": null,
+    "seed": 4,
+    "params": {
+      "game": "ALE/Centipede-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "F_DoubleDunk",
+    "env_id": null,
+    "seed": 5,
+    "params": {
+      "game": "ALE/DoubleDunk-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "G_Freeway",
+    "env_id": null,
+    "seed": 6,
+    "params": {
+      "game": "ALE/Freeway-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "H_Pong",
+    "env_id": null,
+    "seed": 7,
+    "params": {
+      "game": "ALE/Pong-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "I_SpaceInvaders",
+    "env_id": null,
+    "seed": 8,
+    "params": {
+      "game": "ALE/SpaceInvaders-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "J_Tennis",
+    "env_id": null,
+    "seed": 9,
+    "params": {
+      "game": "ALE/Tennis-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  }
+]

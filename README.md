@@ -52,10 +52,19 @@ CartPole:
 python bin/clb-run-dt.py --spec specs_cp.json --strategy cumulative --dataset-root data/cartpole_expert  --seq-len 20 --steps-per-task 50000 --episodes-eval 15 --device cuda
 ```
 
+
 Atari:
 ```bash
-python bin/clb-run-dt.py   --spec specs_atari.json   --strategy cumulative   --steps-per-task 20000   --episodes-eval 10   --device cuda
+python bin/clb-run-dt.py   --spec configs/specs_atari_cl_5_minari_like.json --dataset-root resources/atari_expert --steps 20000 --seq-len 20  --episodes-eval 30 --device cuda   --strategy cumulative 
 ```
+
+## cyfronet
+Atari:
+```bash
+python bin/clb-run-dt.py --spec configs/specs_atari_cl_5_minari_like.json --dataset-root /net/tscratch/people/plgdomin088/datasets/atari_expert --strategy cumulative --steps-per-task 20000   --seq-len 20 --episodes-eval 30 --max-steps 27000 --atari-env minari_like  --replay-check --device cuda
+```
+
+
 
 Panda (offline, PandaReach → PandaPush → PandaPickAndPlace):  
 (requires datasets in `resources/datasets/*panda*_1m_expert.pkl`)
@@ -85,14 +94,28 @@ python bin/clb-run-dt-cartpole-single.py --spec configs/specs_cp.json --dataset-
 For Atari just change the spec:
 
 ```bash
-python bin/clb-run-dt-atari-single.py --spec configs/specs_atari.json --dataset-root resources/atari_expert --steps 20000 --seq-len 20 --batch-size 64 --episodes-eval 10 --max-ep-len 27000 --device cuda --debug-replay
+python bin/clb-run-dt-atari-single.py --spec configs/specs_atari_cl_5_minari_like.json --dataset-root resources/atari_expert --steps 20000 --seq-len 20 --batch-size 64 --episodes-eval 30 --max-ep-len 27000 --device cuda --debug-replay
+```
+
+for atari on cyfronet
+```bash
+python bin/clb-run-dt-atari-single.py --spec configs/specs_atari_cl_5_minari_like.json --dataset-root /net/tscratch/people/plgdomin088/datasets/atari_expert --steps 20000 --seq-len 20 --batch-size 64 --episodes-eval 30 --max-ep-len 27000 --device cuda --debug-replay --rtg-scale 0
  ```
 
+debug dataset and env
+```bash
+python bin/clb-run-dt-atari-single.py  --spec configs/specs_atari.json --dataset-root resources/atari_expert --steps 1 --debug-replay
+ ```
 #### Panda (continuous, offline datasets)
 
 ```bash
 python bin/clb-run-dt-panda-single.py   --datasets-root resources/datasets   --seq-len 20   --steps-per-task 50000   --batch-size 64   --episodes-eval 5   --device cuda
 ```
+### helios
+```bash
+python bin/clb-run-dt-panda-single.py   --datasets-root /net/scratch/hscra/plgrid/plgdomin088/datasets/panda_expert   --seq-len 20   --steps-per-task 50000   --batch-size 64   --episodes-eval 5   --device cuda
+```
+
 
 `clb-run-dt-panda-single.py` trains one PandaDecisionTransformer per task
 (PandaReach, PandaPush, PandaPickAndPlace) only on its own offline dataset
@@ -205,6 +228,6 @@ python tools/inspect_atari_trajs.py --root resources/atari_expert --tasks A_Pong
 ---
 Generate Atari expert dataset in DT `.npz` format from Minari:
 ```bash
-python bin/generate_atari_traj_from_mintari.py --config configs/specs_atari.json --out-root resources/atari_expert --max-len 50000 --obs-dtype float32
+python bin/generate_atari_traj_from_mintari.py --config configs/specs_atari_cl_5_minari_like.json --out-root /net/tscratch/people/plgdomin088/datasets/atari_expert --max-len 50000 --obs-dtype float32
 ```
 ---

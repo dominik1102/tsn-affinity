@@ -43,7 +43,6 @@ class EWCStrategy(BaseStrategy):
             self.opt.step()
         return {}
 
-    # UWAGA: bez @torch.no_grad() tutaj!
     def _estimate_fisher(
         self,
         trajs: List[Trajectory],

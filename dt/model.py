@@ -136,25 +136,14 @@ class Block(nn.Module):
 # Decision Transformer backbone
 # ============================================================
 
-@dataclass
-class DTConfig:
-    n_layer: int = 3
-    n_head: int = 4
-    n_embd: int = 128
-    dropout: float = 0.1
-    bias: bool = False
-
-    K: int = 20
-    max_ep_len: int = 10000
-    state_dim: int = 128
-    act_vocab_size: int = 6
-
-
 class DTBackbone(nn.Module):
     """
     Tokens: (R_0, s_0, a_0, R_1, s_1, a_1, ...)
-    Predict action logits at state token positions => [B, T, A]
+    Output is read at state-token positions -> shape:
+      - discrete:   [B, T, act_vocab_size] logits
+      - continuous: [B, T, act_dim]        predicted actions
     """
+
     def __init__(self, cfg: DTConfig):
         super().__init__()
         self.cfg = cfg
@@ -165,14 +154,21 @@ class DTBackbone(nn.Module):
         self.te = nn.Embedding(cfg.max_ep_len, cfg.n_embd)
         self.re = nn.Linear(1, cfg.n_embd, bias=cfg.bias)
         self.se = nn.Linear(cfg.state_dim, cfg.n_embd, bias=cfg.bias)
-        self.ae = nn.Embedding(cfg.act_vocab_size, cfg.n_embd)
+
+        # action embedding + head depend on discrete/continuous
+        if cfg.act_discrete:
+            self.ae = nn.Embedding(cfg.act_vocab_size, cfg.n_embd)
+            self.act_head = nn.Linear(cfg.n_embd, cfg.act_vocab_size, bias=True)
+        else:
+            self.ae = nn.Linear(cfg.act_dim, cfg.n_embd, bias=cfg.bias)
+            self.act_head = nn.Linear(cfg.n_embd, cfg.act_dim, bias=True)
 
         self.drop = nn.Dropout(cfg.dropout)
-        self.h = nn.ModuleList([Block(cfg.n_embd, cfg.n_head, cfg.dropout, cfg.bias, block_size) for _ in range(cfg.n_layer)])
+        self.h = nn.ModuleList(
+            [Block(cfg.n_embd, cfg.n_head, cfg.dropout, cfg.bias, block_size) for _ in range(cfg.n_layer)]
+        )
         self.ln_f = LayerNorm(cfg.n_embd, bias=cfg.bias)
         self.ln_e = LayerNorm(cfg.n_embd, bias=cfg.bias)
-
-        self.act_head = nn.Linear(cfg.n_embd, cfg.act_vocab_size, bias=True)
 
         self.apply(self._init_weights)
         for pn, p in self.named_parameters():
@@ -194,32 +190,60 @@ class DTBackbone(nn.Module):
 
     def forward(
         self,
-        states: torch.Tensor,                 # [B,T,state_dim]
-        actions: torch.Tensor,                # [B,T] int64 (already clamped >=0)
-        rtgs: torch.Tensor,                   # [B,T,1]
-        timesteps: torch.Tensor,              # [B,T] int64
-        attention_mask: Optional[torch.Tensor] = None,  # [B,T] bool
-    ) -> torch.Tensor:
+        states: torch.Tensor,                    # [B,T,state_dim]
+        actions: torch.Tensor,                   # discrete: [B,T] long   | continuous: [B,T,act_dim] float
+        rtgs: torch.Tensor,                      # [B,T,1]
+        timesteps: Optional[torch.Tensor] = None,# [B,T] long
+        attention_mask: Optional[torch.Tensor] = None, # [B,T] bool (True=valid)
+        *,
+        # ---- aliases for Panda code ----
+        tsteps: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        # ---- optional loss ----
+        targets: Optional[torch.Tensor] = None,
+    ):
+        # accept Panda keyword aliases
+        if timesteps is None:
+            timesteps = tsteps
+        if attention_mask is None:
+            attention_mask = attn_mask
+        if timesteps is None:
+            raise ValueError("DTBackbone.forward: timesteps (or tsteps) must be provided")
+
         B, T, _ = states.shape
         if T > self.cfg.K:
             raise ValueError(f"T={T} exceeds K={self.cfg.K}")
 
+        timesteps = timesteps.to(device=states.device, dtype=torch.long)
         timesteps = torch.clamp(timesteps, 0, self.cfg.max_ep_len - 1)
         t_emb = self.te(timesteps)  # [B,T,E]
 
         s_emb = self.se(states) + t_emb
-        a_emb = self.ae(actions) + t_emb
         r_emb = self.re(rtgs) + t_emb
 
+        if self.cfg.act_discrete:
+            # actions: [B,T] long (already clamped >=0 outside or here)
+            a = actions.to(device=states.device, dtype=torch.long)
+            a = torch.clamp(a, min=0)
+            a_emb = self.ae(a) + t_emb
+        else:
+            # actions: [B,T,act_dim] float
+            a = actions.to(device=states.device, dtype=torch.float32)
+            if self.cfg.tanh_embeddings:
+                a = torch.tanh(a)
+            a_emb = self.ae(a) + t_emb  # Linear -> [B,T,E]
+
         # interleave => [B, 3T, E]
-        x = torch.stack((r_emb, s_emb, a_emb), dim=2)      # [B,T,3,E]
+        x = torch.stack((r_emb, s_emb, a_emb), dim=2)  # [B,T,3,E]
         x = x.reshape(B, 3 * T, self.cfg.n_embd)
         x = self.ln_e(x)
 
         if attention_mask is None:
             attention_mask = torch.ones((B, T), dtype=torch.bool, device=states.device)
+        else:
+            attention_mask = attention_mask.to(device=states.device, dtype=torch.bool)
 
-        # token mask => [B, 3T]
+        # token-level mask => [B,3T]
         tok_mask = attention_mask[:, :, None].expand(B, T, 3).reshape(B, 3 * T)
 
         x = self.drop(x)
@@ -227,9 +251,36 @@ class DTBackbone(nn.Module):
             x = block(x, attn_mask=tok_mask)
         x = self.ln_f(x)
 
-        logits_all = self.act_head(x)       # [B,3T,A]
-        logits = logits_all[:, 1::3, :]     # state tokens => [B,T,A]
-        return logits
+        out_all = self.act_head(x)          # [B,3T,A] or [B,3T,act_dim]
+        out = out_all[:, 1::3, ...]         # state tokens => [B,T,*]
+
+        # continuous: optional tanh on output
+        if (not self.cfg.act_discrete) and self.cfg.act_tanh:
+            out = torch.tanh(out)
+
+        if targets is None:
+            return out
+
+        # compute loss if targets provided (optional)
+        if self.cfg.act_discrete:
+            # targets expected: [B,T] long, may include -1 for padding
+            targ = targets.to(device=states.device, dtype=torch.long)
+            A = out.size(-1)
+            loss = F.cross_entropy(
+                out.reshape(-1, A),
+                targ.reshape(-1),
+                ignore_index=-1,
+                reduction="mean",
+            )
+            return out, loss
+        else:
+            # targets expected: [B,T,act_dim] float
+            targ = targets.to(device=states.device, dtype=torch.float32)
+            mse = ((out - targ) ** 2).mean(dim=-1)  # [B,T]
+            m = attention_mask.float()
+            denom = m.sum().clamp(min=1.0)
+            loss = (mse * m).sum() / denom
+            return out, loss
 
 
 # ============================================================
@@ -278,6 +329,35 @@ class ObsEncoder(nn.Module):
             return self.net(x)
         z = self.cnn(x)
         return self.proj(z)
+from dataclasses import dataclass
+from typing import Optional
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+@dataclass
+class DTConfig:
+    n_layer: int = 3
+    n_head: int = 4
+    n_embd: int = 128
+    dropout: float = 0.1
+    bias: bool = False
+
+    K: int = 20
+    max_ep_len: int = 10000
+    state_dim: int = 128
+
+    # ---- actions ----
+    # discrete Atari:
+    act_discrete: bool = True
+    act_vocab_size: int = 6
+
+    # continuous Panda:
+    act_dim: int = 1
+    act_tanh: bool = False          # apply tanh on output actions
+    tanh_embeddings: bool = False   # tanh() on action inputs before embedding
+
 
 
 # ============================================================
@@ -295,11 +375,17 @@ class DecisionTransformer(nn.Module):
         seq_len: int = 20,
         p_drop: float = 0.1,
         max_ep_len: int = 10000,
+        rtg_scale: float = 1000.0,
     ):
+
         super().__init__()
         self.seq_len = int(seq_len)
         self.n_actions = int(n_actions)
         self.max_ep_len = int(max_ep_len)
+        self.rtg_scale = float(rtg_scale)
+        if not (self.rtg_scale > 0.0):
+            raise ValueError(f"rtg_scale must be > 0, got {self.rtg_scale}")
+
 
         self.obs_enc = ObsEncoder(obs_shape, d_model)
 
@@ -319,15 +405,30 @@ class DecisionTransformer(nn.Module):
         self.reset_history()
 
     def forward(
-        self,
-        obs: torch.Tensor,                      # [B,L,C,H,W] or [B,L,D]
-        actions: torch.Tensor,                  # [B,L] with -1 padding allowed
-        rtg: torch.Tensor,                      # [B,L,1]
-        timesteps: torch.Tensor,                # [B,L]
-        attention_mask: Optional[torch.Tensor] = None,  # [B,L] bool
+            self,
+            obs: torch.Tensor,  # [B,L,C,H,W] or [B,L,D]
+            actions: torch.Tensor,  # [B,L] with -1 padding allowed
+            rtg: torch.Tensor,  # [B,L,1]
+            timesteps: torch.Tensor,  # [B,L]
+            attention_mask: Optional[torch.Tensor] = None,  # [B,L] bool
     ) -> torch.Tensor:
         B, L = actions.shape
         device = obs.device
+
+        # ----------------------------------------------------
+        # Normalize observations (consistent between train and eval)
+        # - if input is uint8 in 0..255 -> divide by 255
+        # - if float but still in 0..255 -> divide by 255
+        # ----------------------------------------------------
+        orig_dtype = obs.dtype
+        obs = obs.to(device=device, dtype=torch.float32)
+
+        if orig_dtype == torch.uint8:
+            obs = obs / 255.0
+        else:
+            # float/half/etc: heuristically detect 0..255 range
+            if obs.numel() > 0 and float(obs.max().item()) > 1.5:
+                obs = obs / 255.0
 
         # Encode observations => states [B,L,d_model]
         if obs.dim() == 5:
@@ -347,7 +448,10 @@ class DecisionTransformer(nn.Module):
         timesteps = timesteps.to(device=device, dtype=torch.long)
         timesteps = torch.clamp(timesteps, 0, self.max_ep_len - 1)
 
+        # RTG scaling (inside the model so train and eval are always consistent)
         rtg = rtg.to(device=device, dtype=torch.float32)
+        if self.rtg_scale != 1.0:
+            rtg = rtg / self.rtg_scale
 
         if attention_mask is None:
             attention_mask = torch.ones((B, L), dtype=torch.bool, device=device)

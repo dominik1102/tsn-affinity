@@ -1,23 +1,23 @@
 from __future__ import annotations
+
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
 
-from dt.model import DecisionTransformerConfig, ObsEncoder, DTBackbone
+from dt.model import DTConfig, ObsEncoder, DTBackbone
 
 
 class PandaDecisionTransformer(nn.Module):
     """
-    Decision Transformer for continuous Panda actions, built on top of DTBackbone.
+    Decision Transformer for continuous Panda actions (DTBackbone).
 
-    During training:
-        obs:       [B, L, obs_dim]
-        actions:   [B, L, act_dim]  (previous actions, shifted)
-        rtg:       [B, L, 1]
-        timesteps: [B, L]
+    TRAINING: actions aligned => actions[:, t] = a_t (NO SHIFT).
+    INFERENCE: last action token is a zero placeholder; previous are past actions.
 
-    Returns:
-        [B, L, act_dim] — predicted continuous actions.
+    Adds:
+      - observation normalization (mean/std) like in your old working project
+      - rtg_scale (same idea as Atari runner): RTG is divided by rtg_scale inside forward
     """
 
     def __init__(
@@ -30,106 +30,138 @@ class PandaDecisionTransformer(nn.Module):
         seq_len: int = 20,
         p_drop: float = 0.1,
         max_ep_len: int = 2048,
+        act_tanh: bool = False,
+        # --- NEW ---
+        rtg_scale: float = 1.0,
+        obs_mean: Optional[np.ndarray] = None,
+        obs_std: Optional[np.ndarray] = None,
     ):
         super().__init__()
-        self.seq_len = seq_len
-        self.d_model = d_model
-        self.act_dim = act_dim
-        self.obs_dim = obs_dim
-        self.max_ep_len = max_ep_len
+        self.seq_len = int(seq_len)
+        self.d_model = int(d_model)
+        self.act_dim = int(act_dim)
+        self.obs_dim = int(obs_dim)
+        self.max_ep_len = int(max_ep_len)
 
-        # Reuse the generic ObsEncoder from above (vector observations)
-        self.obs_enc = ObsEncoder((obs_dim,), d_model)
+        # --- obs normalization buffers (saved with checkpoint) ---
+        self.register_buffer(
+            "obs_mean",
+            torch.zeros(self.obs_dim, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "obs_std",
+            torch.ones(self.obs_dim, dtype=torch.float32),
+            persistent=True,
+        )
 
-        # DTBackbone configuration (continuous actions)
-        config = DecisionTransformerConfig(
+        if obs_mean is not None:
+            m = torch.as_tensor(obs_mean, dtype=torch.float32).reshape(-1)
+            if m.numel() != self.obs_dim:
+                raise ValueError(f"obs_mean has dim={m.numel()} but obs_dim={self.obs_dim}")
+            self.obs_mean.copy_(m)
+
+        if obs_std is not None:
+            s = torch.as_tensor(obs_std, dtype=torch.float32).reshape(-1)
+            if s.numel() != self.obs_dim:
+                raise ValueError(f"obs_std has dim={s.numel()} but obs_dim={self.obs_dim}")
+            self.obs_std.copy_(torch.clamp(s, min=1e-6))
+
+        # --- RTG scale buffer (spójnie z Atari) ---
+        self.register_buffer(
+            "rtg_scale",
+            torch.tensor(float(rtg_scale), dtype=torch.float32),
+            persistent=True,
+        )
+
+        self.obs_enc = ObsEncoder((self.obs_dim,), self.d_model)
+
+        cfg = DTConfig(
             n_layer=n_layers,
             n_head=n_heads,
-            n_embd=d_model,
+            n_embd=self.d_model,
             dropout=p_drop,
             bias=False,
-            K=seq_len,
-            max_ep_len=max_ep_len,
-            state_dim=d_model,   # state = encoded observation
-            act_dim=act_dim,     # continuous actions
-            act_discrete=False,  # <-- continuous
-            act_vocab_size=1,    # unused for continuous
-            act_tanh=False,
+            K=self.seq_len,
+            max_ep_len=self.max_ep_len,
+            state_dim=self.d_model,
+            act_dim=self.act_dim,
+            act_discrete=False,
+            act_vocab_size=1,
+            act_tanh=bool(act_tanh),
             tanh_embeddings=False,
         )
-        self.dt = DTBackbone(config)
+        self.dt = DTBackbone(cfg)
 
-        # Internal history buffers for act()
         self.reset_history()
 
-    # ------------------------------------------------------------------
-    # Training forward
-    # ------------------------------------------------------------------
+    def _norm_obs(self, obs: torch.Tensor) -> torch.Tensor:
+        # obs: [B,L,obs_dim]
+        mean = self.obs_mean.view(1, 1, -1).to(device=obs.device, dtype=obs.dtype)
+        std = self.obs_std.view(1, 1, -1).to(device=obs.device, dtype=obs.dtype)
+        return (obs - mean) / std
+
+    def _scale_rtg(self, rtg: torch.Tensor) -> torch.Tensor:
+        # rtg: [B,L,1]
+        s = self.rtg_scale.to(device=rtg.device, dtype=rtg.dtype).clamp(min=1e-6)
+        return rtg / s
+
     def forward(
         self,
-        obs: torch.Tensor,
-        actions: torch.Tensor,
-        rtg: torch.Tensor,
-        timesteps: torch.Tensor,
+        obs: torch.Tensor,                  # [B,L,obs_dim]
+        actions: torch.Tensor,              # [B,L,act_dim] aligned
+        rtg: torch.Tensor,                  # [B,L,1]
+        timesteps: torch.Tensor,            # [B,L]
+        attention_mask: Optional[torch.Tensor] = None,  # [B,L] bool
     ) -> torch.Tensor:
-        """
-        Args:
-            obs:       [B, L, obs_dim]
-            actions:   [B, L, act_dim]  (previous actions, shifted)
-            rtg:       [B, L, 1]
-            timesteps: [B, L]
-
-        Returns:
-            Tensor of shape [B, L, act_dim] with predicted actions.
-        """
         if obs.dim() != 3:
-            raise ValueError(
-                f"PandaDecisionTransformer.forward expects obs of shape [B, L, obs_dim], "
-                f"got {obs.shape}"
-            )
+            raise ValueError(f"Expected obs [B,L,obs_dim], got {obs.shape}")
 
         B, L, _ = obs.shape
         device = obs.device
 
-        # --- encode observations -> states [B, L, d_model] ---
-        obs_flat = obs.view(B * L, -1)                # [B*L, obs_dim]
-        s_tok = self.obs_enc(obs_flat).view(B, L, -1) # [B, L, d_model]
+        obs = obs.to(device=device, dtype=torch.float32)
+        actions = actions.to(device=device, dtype=torch.float32)
+        rtg = rtg.to(device=device, dtype=torch.float32)
 
-        # actions, rtg, timesteps
-        actions = actions.to(device)
-        rtg = rtg.to(device)
-        timesteps = timesteps.to(device).long()
+        timesteps = timesteps.to(device=device, dtype=torch.long)
         timesteps = torch.clamp(timesteps, max=self.max_ep_len - 1)
 
-        # full attention mask (no padding for now)
-        attn_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+        # NEW: normalize obs + scale rtg
+        obs = self._norm_obs(obs)
+        rtg = self._scale_rtg(rtg)
 
-        # Call DTBackbone in "training mode" (targets != None) to get predictions for all L
-        # For continuous actions DTBackbone uses MSE internally, but we ignore the loss here
-        pred_actions, _ = self.dt(
+        # Encode obs -> states [B,L,d_model]
+        obs_flat = obs.reshape(B * L, -1)
+        s_tok = self.obs_enc(obs_flat).reshape(B, L, -1)
+
+        if attention_mask is None:
+            attn_mask = torch.ones((B, L), dtype=torch.bool, device=device)
+        else:
+            attn_mask = attention_mask.to(device=device, dtype=torch.bool)
+
+        return self.dt(
             states=s_tok,
             actions=actions,
             rtgs=rtg,
             tsteps=timesteps,
             attn_mask=attn_mask,
-            targets=actions,  # just to get [B, L, act_dim] outputs
         )
-        # pred_actions: [B, L, act_dim]
-        return pred_actions
 
-    # ------------------------------------------------------------------
-    # History handling for act()
-    # ------------------------------------------------------------------
     def reset_history(self):
-        """
-        Reset internal history buffers used by act().
-
-        Call this method at the beginning of each Panda episode.
-        """
-        self._hist_obs: list[torch.Tensor] = []
+        self._hist_obs: list[np.ndarray] = []
         self._hist_actions: list[np.ndarray] = []
         self._hist_rtgs: list[float] = []
         self._hist_t: list[int] = []
+
+    @staticmethod
+    def _pad_or_trunc_1d(x: np.ndarray, size: int) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size < size:
+            return np.pad(x, (0, size - x.size), mode="constant")
+        if x.size > size:
+            return x[:size]
+        return x
 
     @torch.no_grad()
     def act(
@@ -137,97 +169,54 @@ class PandaDecisionTransformer(nn.Module):
         obs,
         rtg_scalar: float,
         t: int,
-        prev_action=None,  # kept for API compatibility
+        prev_action=None,  # kept for compatibility
         device: str = "cpu",
-    ):
-        """
-        Greedy action selection with a rolling context for continuous actions.
-
-        This method:
-          - appends the current observation and RTG to internal history,
-          - builds a sequence of up to `seq_len` past (obs, action, rtg, t),
-          - runs a forward pass and returns the last predicted action.
-
-        Args:
-            obs: flat observation vector (obs_dim,). If your env returns a dict,
-                 flatten it first using the same logic as in the offline dataset.
-            rtg_scalar: scalar return-to-go (placeholder is fine).
-            t: environment timestep.
-            prev_action: unused; history is tracked inside the model.
-            device: kept for API compatibility, actual device is taken from model params.
-
-        Returns:
-            action as a numpy array of shape [act_dim].
-        """
+    ) -> np.ndarray:
         self.eval()
+        dev = next(self.parameters()).device
 
-        # Use the real device of the model parameters
-        param_device = next(self.parameters()).device
-        device = torch.device(param_device)
+        o = self._pad_or_trunc_1d(np.asarray(obs, dtype=np.float32), self.obs_dim)
 
-        if isinstance(obs, dict):
-            raise ValueError(
-                "PandaDecisionTransformer.act expects a flat observation vector, "
-                "got a dict. Flatten obs before calling this method."
-            )
-
-        # Convert current observation to tensor and store in history
-        o_np = np.asarray(obs, dtype=np.float32).ravel()
-        o_t = torch.from_numpy(o_np).to(device=device)
-        self._hist_obs.append(o_t)
+        self._hist_obs.append(o)
         self._hist_rtgs.append(float(rtg_scalar))
         self._hist_t.append(int(t))
 
-        # Keep only the last `seq_len` steps
+        # keep last seq_len steps
         if len(self._hist_obs) > self.seq_len:
-            self._hist_obs = self._hist_obs[-self.seq_len:]
-            self._hist_rtgs = self._hist_rtgs[-self.seq_len:]
-            self._hist_t = self._hist_t[-self.seq_len:]
-            if self._hist_actions:
-                self._hist_actions = self._hist_actions[-self.seq_len:]
+            self._hist_obs = self._hist_obs[-self.seq_len :]
+            self._hist_rtgs = self._hist_rtgs[-self.seq_len :]
+            self._hist_t = self._hist_t[-self.seq_len :]
+            self._hist_actions = self._hist_actions[-self.seq_len :]
 
         L = len(self._hist_obs)
-        B = 1
+        K = self.seq_len
+        start = K - L  # left pad
 
-        # Build observation batch: [1, L, obs_dim]
-        obs_seq = torch.stack(self._hist_obs, dim=0).unsqueeze(0).to(device=device)
+        obs_seq = torch.zeros((1, K, self.obs_dim), dtype=torch.float32, device=dev)
+        act_seq = torch.zeros((1, K, self.act_dim), dtype=torch.float32, device=dev)
+        rtg_seq = torch.zeros((1, K, 1), dtype=torch.float32, device=dev)
+        ts_seq = torch.zeros((1, K), dtype=torch.long, device=dev)
+        mask = torch.zeros((1, K), dtype=torch.bool, device=dev)
 
-        # Build actions batch: previous actions per step [1, L, act_dim]
-        zero_action = torch.zeros(self.act_dim, dtype=torch.float32, device=device)
-        actions_tensors = []
-        for i in range(L):
-            if i == 0:
-                # First step has no previous action
-                actions_tensors.append(zero_action)
-            else:
-                idx = i - 1
-                if idx < len(self._hist_actions):
-                    a_prev_np = np.asarray(self._hist_actions[idx], dtype=np.float32)
-                    a_prev_t = torch.from_numpy(a_prev_np).to(
-                        device=device, dtype=torch.float32
-                    )
-                    actions_tensors.append(a_prev_t)
-                else:
-                    actions_tensors.append(zero_action)
+        obs_seq[0, start:, :] = torch.from_numpy(np.stack(self._hist_obs, axis=0)).to(dev)
+        rtg_seq[0, start:, 0] = torch.tensor(self._hist_rtgs, dtype=torch.float32, device=dev)
+        ts_seq[0, start:] = torch.tensor(self._hist_t, dtype=torch.long, device=dev).clamp(max=self.max_ep_len - 1)
+        mask[0, start:] = True
 
-        actions_seq = torch.stack(actions_tensors, dim=0).unsqueeze(0)  # [1, L, act_dim]
+        # past actions fill up to L-1, last is placeholder (zeros)
+        past = self._hist_actions
+        if len(past) > (L - 1):
+            past = past[-(L - 1):]
 
-        # Build RTG and timestep sequences
-        rtg_seq = torch.tensor(
-            self._hist_rtgs, dtype=torch.float32, device=device
-        ).view(B, L, 1)
+        for i, a in enumerate(past):
+            a = self._pad_or_trunc_1d(a, self.act_dim)
+            act_seq[0, start + i, :] = torch.from_numpy(a).to(dev)
 
-        ts_seq = torch.tensor(self._hist_t, dtype=torch.long, device=device)
-        ts_seq = ts_seq.clamp(max=self.max_ep_len - 1).view(B, L)
+        pred = self.forward(obs_seq, act_seq, rtg_seq, ts_seq, attention_mask=mask)  # [1,K,act_dim]
+        a_t = pred[0, -1, :].detach().cpu().numpy().astype(np.float32, copy=False)
 
-        # Forward pass over the full history
-        pred_seq = self.forward(obs_seq, actions_seq, rtg_seq, ts_seq)  # [1, L, act_dim]
-        action_t = pred_seq[:, -1, :]  # [1, act_dim]
-
-        # Store and return action
-        action_np = action_t[0].detach().cpu().numpy()
-        self._hist_actions.append(action_np)
+        self._hist_actions.append(a_t)
         if len(self._hist_actions) > self.seq_len:
-            self._hist_actions = self._hist_actions[-self.seq_len:]
+            self._hist_actions = self._hist_actions[-self.seq_len :]
 
-        return action_np
+        return a_t
