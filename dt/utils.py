@@ -587,7 +587,7 @@ def evaluate_dt_panda(
     model,
     env: gym.Env,
     episodes: int = 5,
-    device: Union[str, torch.device] = "cpu",
+    device: Union[str, torch.device] = "cuda",
     max_steps: Optional[int] = None,
     target_return: float = 0.0,
     seed: Optional[int] = None,

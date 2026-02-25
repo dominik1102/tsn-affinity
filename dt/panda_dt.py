@@ -16,8 +16,8 @@ class PandaDecisionTransformer(nn.Module):
     INFERENCE: last action token is a zero placeholder; previous are past actions.
 
     Adds:
-      - observation normalization (mean/std) like in your old working project
-      - rtg_scale (same idea as Atari runner): RTG is divided by rtg_scale inside forward
+      - observation normalization (mean/std) like in your old working project,
+      - rtg scaling via self.rtg_scale (Atari-style).
     """
 
     def __init__(
@@ -29,12 +29,11 @@ class PandaDecisionTransformer(nn.Module):
         n_heads: int = 4,
         seq_len: int = 20,
         p_drop: float = 0.1,
-        max_ep_len: int = 2048,
+        max_ep_len: int = 256,
         act_tanh: bool = False,
-        # --- NEW ---
-        rtg_scale: float = 1.0,
         obs_mean: Optional[np.ndarray] = None,
         obs_std: Optional[np.ndarray] = None,
+        rtg_scale: float = 1.0,
     ):
         super().__init__()
         self.seq_len = int(seq_len)
@@ -43,17 +42,12 @@ class PandaDecisionTransformer(nn.Module):
         self.obs_dim = int(obs_dim)
         self.max_ep_len = int(max_ep_len)
 
+        # rtg_scale: keep as float attribute (safe with your other code style)
+        self.rtg_scale = float(max(1e-6, rtg_scale))
+
         # --- obs normalization buffers (saved with checkpoint) ---
-        self.register_buffer(
-            "obs_mean",
-            torch.zeros(self.obs_dim, dtype=torch.float32),
-            persistent=True,
-        )
-        self.register_buffer(
-            "obs_std",
-            torch.ones(self.obs_dim, dtype=torch.float32),
-            persistent=True,
-        )
+        self.register_buffer("obs_mean", torch.zeros(self.obs_dim, dtype=torch.float32), persistent=True)
+        self.register_buffer("obs_std", torch.ones(self.obs_dim, dtype=torch.float32), persistent=True)
 
         if obs_mean is not None:
             m = torch.as_tensor(obs_mean, dtype=torch.float32).reshape(-1)
@@ -66,13 +60,6 @@ class PandaDecisionTransformer(nn.Module):
             if s.numel() != self.obs_dim:
                 raise ValueError(f"obs_std has dim={s.numel()} but obs_dim={self.obs_dim}")
             self.obs_std.copy_(torch.clamp(s, min=1e-6))
-
-        # --- RTG scale buffer (spójnie z Atari) ---
-        self.register_buffer(
-            "rtg_scale",
-            torch.tensor(float(rtg_scale), dtype=torch.float32),
-            persistent=True,
-        )
 
         self.obs_enc = ObsEncoder((self.obs_dim,), self.d_model)
 
@@ -101,16 +88,11 @@ class PandaDecisionTransformer(nn.Module):
         std = self.obs_std.view(1, 1, -1).to(device=obs.device, dtype=obs.dtype)
         return (obs - mean) / std
 
-    def _scale_rtg(self, rtg: torch.Tensor) -> torch.Tensor:
-        # rtg: [B,L,1]
-        s = self.rtg_scale.to(device=rtg.device, dtype=rtg.dtype).clamp(min=1e-6)
-        return rtg / s
-
     def forward(
         self,
         obs: torch.Tensor,                  # [B,L,obs_dim]
-        actions: torch.Tensor,              # [B,L,act_dim] aligned
-        rtg: torch.Tensor,                  # [B,L,1]
+        actions: torch.Tensor,              # [B,L,act_dim] aligned (a_t)
+        rtg: torch.Tensor,                  # [B,L,1] in *raw* reward units
         timesteps: torch.Tensor,            # [B,L]
         attention_mask: Optional[torch.Tensor] = None,  # [B,L] bool
     ) -> torch.Tensor:
@@ -124,12 +106,13 @@ class PandaDecisionTransformer(nn.Module):
         actions = actions.to(device=device, dtype=torch.float32)
         rtg = rtg.to(device=device, dtype=torch.float32)
 
+        # scale RTG like Atari runner does
+        rtg = rtg / float(self.rtg_scale)
+
         timesteps = timesteps.to(device=device, dtype=torch.long)
         timesteps = torch.clamp(timesteps, max=self.max_ep_len - 1)
 
-        # NEW: normalize obs + scale rtg
         obs = self._norm_obs(obs)
-        rtg = self._scale_rtg(rtg)
 
         # Encode obs -> states [B,L,d_model]
         obs_flat = obs.reshape(B * L, -1)
@@ -203,7 +186,7 @@ class PandaDecisionTransformer(nn.Module):
         ts_seq[0, start:] = torch.tensor(self._hist_t, dtype=torch.long, device=dev).clamp(max=self.max_ep_len - 1)
         mask[0, start:] = True
 
-        # past actions fill up to L-1, last is placeholder (zeros)
+        # past actions fill up to L-1, last is placeholder
         past = self._hist_actions
         if len(past) > (L - 1):
             past = past[-(L - 1):]
@@ -211,6 +194,8 @@ class PandaDecisionTransformer(nn.Module):
         for i, a in enumerate(past):
             a = self._pad_or_trunc_1d(a, self.act_dim)
             act_seq[0, start + i, :] = torch.from_numpy(a).to(dev)
+
+        # last action token stays zero (unknown a_t)
 
         pred = self.forward(obs_seq, act_seq, rtg_seq, ts_seq, attention_mask=mask)  # [1,K,act_dim]
         a_t = pred[0, -1, :].detach().cpu().numpy().astype(np.float32, copy=False)

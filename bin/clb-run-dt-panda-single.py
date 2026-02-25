@@ -10,14 +10,14 @@ import numpy as np
 import torch
 
 import gymnasium as gym
-import panda_gym  # noqa: F401 (register Panda envs)
+import panda_gym  # noqa: F401
 from gymnasium.wrappers import FlattenObservation
 
 from bin.config import PANDA_TASKS
 from clbench.io.run_logger import build_run_dir, save_json
 
 from dt.dataset import Trajectory
-from dt.dataset_panda import load_panda_offline_pkl, make_minibatches_panda
+from dt.dataset_panda import load_panda_offline_pkl  # keep loader
 from dt.panda_dt import PandaDecisionTransformer
 from dt.utils import evaluate_dt_panda
 
@@ -102,10 +102,9 @@ def make_panda_env(env_id: str) -> gym.Env:
     return env
 
 
-def compute_mean_std(trajs: List[Trajectory], obs_dim: int):
+def compute_mean_std(trajs: List[Trajectory], obs_dim: int) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Mean/std po wszystkich obserwacjach z datasetu (bez paddingów),
-    w stylu Twojego starego projektu.
+    Streaming mean/std over all observations in dataset (Welford-ish).
     """
     count = 0
     mean = np.zeros(obs_dim, dtype=np.float64)
@@ -135,8 +134,80 @@ def compute_mean_std(trajs: List[Trajectory], obs_dim: int):
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def auto_rtg_scale(episode_returns: np.ndarray, mode: str = "p95") -> float:
+    """
+    Choose RTG scale so RTG values are in a reasonable range.
+    """
+    if episode_returns.size == 0:
+        return 1.0
+    x = np.abs(episode_returns.astype(np.float32))
+    if mode == "max":
+        s = float(np.max(x))
+    else:
+        s = float(np.percentile(x, 95))
+    return float(max(1.0, s))
+
+
+def make_minibatches_panda_fast(
+    trajs: List[Trajectory],
+    *,
+    seq_len: int,
+    batch_size: int,
+    device: torch.device,
+    obs_dim: int,
+    act_dim: int,
+):
+    """
+    IMPORTANT: works for very short episodes (PandaReach).
+    LEFT padding + attention_mask, like your old HF collator.
+    """
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    dev = device
+
+    lens = np.array([len(t.actions) for t in trajs], dtype=np.int64)
+    lens = np.clip(lens, 1, None)
+    cdf = np.cumsum(lens / lens.sum())
+
+    while True:
+        u = np.random.rand(batch_size)
+        idxs = np.searchsorted(cdf, u, side="right")
+
+        obs_b = np.zeros((batch_size, seq_len, obs_dim), dtype=np.float32)
+        act_b = np.zeros((batch_size, seq_len, act_dim), dtype=np.float32)
+        rtg_b = np.zeros((batch_size, seq_len, 1), dtype=np.float32)
+        ts_b  = np.zeros((batch_size, seq_len), dtype=np.int64)
+        mask_b = np.zeros((batch_size, seq_len), dtype=np.bool_)
+
+        for b, idx in enumerate(idxs):
+            tr = trajs[int(idx)]
+            L = int(len(tr.actions))
+            si = np.random.randint(0, L)
+            end = min(si + seq_len, L)
+            tlen = end - si
+            pad = seq_len - tlen
+
+            obs = np.asarray(tr.obs, dtype=np.float32).reshape(-1, obs_dim)[si:end]
+            act = np.asarray(tr.actions, dtype=np.float32).reshape(-1, act_dim)[si:end]
+            rtg = np.asarray(tr.returns_to_go, dtype=np.float32).reshape(-1)[si:end]
+
+            obs_b[b, pad:, :] = obs
+            act_b[b, pad:, :] = act
+            rtg_b[b, pad:, 0] = rtg
+            ts_b[b, pad:] = np.arange(si, si + tlen, dtype=np.int64)
+            mask_b[b, pad:] = True
+
+        yield (
+            torch.from_numpy(obs_b).to(dev),
+            torch.from_numpy(act_b).to(dev),
+            torch.from_numpy(rtg_b).to(dev),
+            torch.from_numpy(ts_b).to(dev),
+            torch.from_numpy(mask_b).to(dev),
+        )
+
+
 # ------------------------------------------------------------
-# Training (single task offline)
+# Training
 # ------------------------------------------------------------
 def train_single_panda_task(
     trajs: List[Trajectory],
@@ -149,6 +220,9 @@ def train_single_panda_task(
     obs_mean: np.ndarray,
     obs_std: np.ndarray,
     rtg_scale: float,
+    lr: float,
+    weight_decay: float,
+    grad_clip: float,
     log_every: int = 200,
 ) -> Tuple[torch.nn.Module, List[Dict[str, float]]]:
     _maybe_set_cuda_device(device_t)
@@ -161,27 +235,26 @@ def train_single_panda_task(
         n_heads=4,
         seq_len=seq_len,
         p_drop=0.1,
-        # NEW:
+        max_ep_len=256,
+        act_tanh=False,
         obs_mean=obs_mean,
         obs_std=obs_std,
-        rtg_scale=float(rtg_scale),
-        act_tanh=False,  # możesz potem przetestować True
-        max_ep_len=2048,
+        rtg_scale=rtg_scale,
     ).to(device_t)
 
     opt = torch.optim.AdamW(
         model.parameters(),
-        lr=3e-4,
-        weight_decay=1e-4,
+        lr=float(lr),
+        weight_decay=float(weight_decay),
     )
 
-    loader = make_minibatches_panda(
+    loader = make_minibatches_panda_fast(
         trajs,
         seq_len=seq_len,
         batch_size=batch_size,
-        device=device_t.type,  # "cpu"/"cuda"
-        act_dim=act_dim,
+        device=device_t,
         obs_dim=obs_dim,
+        act_dim=act_dim,
     )
 
     train_log: List[Dict[str, float]] = []
@@ -190,20 +263,18 @@ def train_single_panda_task(
     for step in range(int(steps)):
         obs, actions, rtg, ts, mask = next(loader)
 
-        mask = mask.to(dtype=torch.bool)
-
+        # mask is bool already
         pred = model(obs, actions, rtg, ts, attention_mask=mask)  # [B, L, act_dim]
-        mse_per_step = ((pred - actions) ** 2).mean(dim=-1)       # [B, L]
+
+        mse_per_step = ((pred - actions) ** 2).mean(dim=-1)  # [B, L]
 
         mask_f = mask.float()
-        valid = mask_f.sum()
-        numer = (mse_per_step * mask_f).sum()
-        loss_masked = numer / (valid + 1e-8)
-        loss = torch.where(valid > 0, loss_masked, mse_per_step.mean())
+        denom = mask_f.sum().clamp(min=1.0)
+        loss = (mse_per_step * mask_f).sum() / denom
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
         opt.step()
 
         if log_every > 0 and (((step + 1) % log_every) == 0 or step == 0):
@@ -221,12 +292,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--task", type=str, default="all", choices=["all", *PANDA_TASKS.keys()])
 
-    p.add_argument("--steps-per-task", type=int, default=2000)
+    p.add_argument("--steps-per-task", type=int, default=20000)
     p.add_argument("--seq-len", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--episodes-eval", type=int, default=5)
+    p.add_argument("--episodes-eval", type=int, default=10)
     p.add_argument("--max-steps", type=int, default=None)
-    p.add_argument("--log-every", type=int, default=200)
+    p.add_argument("--log-every", type=int, default=500)
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -236,20 +307,26 @@ def main():
     p.add_argument("--target-mode", choices=["max", "p90", "mean"], default="max")
     p.add_argument("--target-return", type=float, default=None)
 
-    # NEW: rtg_scale
-    p.add_argument(
-        "--rtg-scale",
-        type=float,
-        default=None,
-        help="If set, overrides auto rtg_scale. If None: rtg_scale = max(1.0, max_abs_return).",
-    )
+    # optimization knobs (closer to your old working yaml)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--grad-clip", type=float, default=0.25)
 
+    # RTG scaling
+    p.add_argument("--rtg-scale", type=str, default="auto", help="auto|max|<float> (e.g. 33.0)")
+
+    # output directory
     p.add_argument("--runs-root", type=str, default="runs")
     p.add_argument("--tag", type=str, default="")
 
     args = p.parse_args()
 
     _set_seed(args.seed)
+
+    # a bit of speed (safe)
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     device_t = torch.device(args.device)
     _maybe_set_cuda_device(device_t)
@@ -293,22 +370,26 @@ def main():
         print(f"[dataset] obs_dim={obs_dim}, act_dim={act_dim}, n_trajs={len(trajs)}")
         print(f"[dataset] return mean={rets.mean():.3f} min={rets.min():.3f} max={rets.max():.3f}")
 
-        # --- NEW: obs normalization (old-project style) ---
+        # --- compute obs normalization stats (old-project style) ---
         obs_mean, obs_std = compute_mean_std(trajs, obs_dim)
+        print(f"[dataset] computed obs_mean/std (std min={obs_std.min():.6f}, max={obs_std.max():.6f})")
 
-        # --- NEW: rtg_scale (spójnie z Atari) ---
-        if args.rtg_scale is not None:
-            rtg_scale = float(args.rtg_scale)
+        # --- rtg scale ---
+        if args.rtg_scale.lower() == "auto":
+            rtg_scale = auto_rtg_scale(rets, mode="p95")
+        elif args.rtg_scale.lower() == "max":
+            rtg_scale = auto_rtg_scale(rets, mode="max")
         else:
-            rtg_scale = float(max(1.0, float(np.max(np.abs(rets))) if rets.size else 1.0))
-        print(f"[rtg_scale] {rtg_scale:.6f}")
+            rtg_scale = float(args.rtg_scale)
+            rtg_scale = max(1.0, rtg_scale)
+        print(f"[dataset] rtg_scale={rtg_scale:.3f}")
 
-        # Choose target_return for evaluation (DT conditioning)
+        # target_return for evaluation
         if args.target_return is not None:
             target = float(args.target_return)
         else:
             target = pick_target_return(rets, args.target_mode)
-        print(f"[eval] target_return={target:.6f} (mode={args.target_mode})")
+        print(f"[eval] target_return={target:.3f} (mode={args.target_mode})")
 
         task_dir = os.path.join(run_dir, name)
         os.makedirs(task_dir, exist_ok=True)
@@ -316,11 +397,20 @@ def main():
         env = make_panda_env(env_id)
 
         try:
+            # optional seed
             try:
                 env.reset(seed=int(args.seed))
             except TypeError:
                 pass
 
+            # max_steps default
+            max_steps = args.max_steps
+            if max_steps is None:
+                max_steps = getattr(getattr(env, "spec", None), "max_episode_steps", None)
+            if max_steps is None:
+                max_steps = 50  # PandaGym usually 50; safe
+
+            # train
             model, train_log = train_single_panda_task(
                 trajs=trajs,
                 obs_dim=obs_dim,
@@ -332,24 +422,17 @@ def main():
                 obs_mean=obs_mean,
                 obs_std=obs_std,
                 rtg_scale=rtg_scale,
+                lr=args.lr,
+                weight_decay=args.weight_decay,
+                grad_clip=args.grad_clip,
                 log_every=args.log_every,
             )
 
             if train_log:
-                _write_csv(
-                    os.path.join(task_dir, "train_log.csv"),
-                    train_log,
-                    fieldnames=["step", "loss"],
-                )
+                _write_csv(os.path.join(task_dir, "train_log.csv"), train_log, fieldnames=["step", "loss"])
 
+            # evaluate
             model.eval()
-
-            max_steps = args.max_steps
-            if max_steps is None:
-                max_steps = getattr(getattr(env, "spec", None), "max_episode_steps", None)
-            if max_steps is None:
-                max_steps = 200
-
             score = evaluate_dt_panda(
                 model=model,
                 env=env,
@@ -361,6 +444,7 @@ def main():
                 obs_pad_to=obs_dim,
                 act_pad_to=act_dim,
                 clip_action=True,
+                gamma=float(args.gamma),
             )
 
             scores[name] = float(score)
@@ -386,10 +470,7 @@ def main():
                     "target_return": float(target),
                     "seed": int(args.seed),
                     "device": str(device_t),
-                    # NEW:
                     "rtg_scale": float(rtg_scale),
-                    "obs_mean": obs_mean.tolist(),
-                    "obs_std": obs_std.tolist(),
                 },
             )
 
@@ -426,8 +507,10 @@ def main():
             "target_mode": str(args.target_mode),
             "target_return_override": args.target_return,
             "seed": int(args.seed),
-            # NEW:
-            "rtg_scale_override": args.rtg_scale,
+            "rtg_scale": args.rtg_scale,
+            "lr": float(args.lr),
+            "weight_decay": float(args.weight_decay),
+            "grad_clip": float(args.grad_clip),
         },
     )
 

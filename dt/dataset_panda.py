@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Iterator
 import pickle
 import numpy as np
 import torch
@@ -161,103 +161,60 @@ def load_panda_offline_pkl(path: str, gamma: float = 1.0) -> List[Trajectory]:
 
 def make_minibatches_panda(
     trajs: List[Trajectory],
+    *,
     seq_len: int,
     batch_size: int,
     device: str,
     act_dim: int,
     obs_dim: int,
-):
+) -> Iterator:
     """
-    Minibatch generator for Panda with continuous actions.
+    Fast DT-style sampler:
+      - samples trajectories proportional to length (like HF collator),
+      - samples random start index,
+      - LEFT pads to seq_len (works even if traj is shorter than seq_len),
+      - returns attention mask.
+    """
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    dev = torch.device(device)
 
-    Returns:
-      obs:     [B, L, obs_dim]   (padded/truncated to `obs_dim`)
-      actions: [B, L, act_dim]   (padded/truncated to `act_dim`)
-      rtg:     [B, L, 1]
-      ts:      [B, L]
-      mask:    [B, L]  (1 for real steps, 0 for padding)
-    """
-    import numpy as _np
-    import torch
+    lens = np.array([len(t.actions) for t in trajs], dtype=np.int64)
+    lens = np.clip(lens, 1, None)
+    cdf = np.cumsum(lens / lens.sum())
 
     while True:
-        B_obs, B_actions, B_rtg, B_ts, B_mask = [], [], [], [], []
+        u = np.random.rand(batch_size)
+        idxs = np.searchsorted(cdf, u, side="right")
 
-        for _ in range(batch_size):
-            tr = _np.random.choice(trajs)
-            T = tr.actions.shape[0]
+        obs_b = np.zeros((batch_size, seq_len, obs_dim), dtype=np.float32)
+        act_b = np.zeros((batch_size, seq_len, act_dim), dtype=np.float32)
+        rtg_b = np.zeros((batch_size, seq_len, 1), dtype=np.float32)
+        ts_b  = np.zeros((batch_size, seq_len), dtype=np.int64)
+        mask_b = np.zeros((batch_size, seq_len), dtype=np.bool_)
 
-            start = 0 if T <= seq_len else _np.random.randint(0, T - seq_len + 1)
-            end = min(start + seq_len, T)
+        for b, idx in enumerate(idxs):
+            tr = trajs[int(idx)]
+            L = int(len(tr.actions))
+            si = np.random.randint(0, L)  # start anywhere
+            end = min(si + seq_len, L)
+            tlen = end - si
+            pad = seq_len - tlen  # LEFT pad
 
-            # Slice trajectory
-            o = tr.obs[start:end]          # [L, D_obs_task]
-            a = tr.actions[start:end]      # [L, D_act_task]
-            rtg = tr.returns_to_go[start:end]
-            ts = tr.timesteps[start:end]
+            obs = np.asarray(tr.obs, dtype=np.float32).reshape(-1, obs_dim)[si:end]
+            act = np.asarray(tr.actions, dtype=np.float32).reshape(-1, act_dim)[si:end]
+            rtg = np.asarray(tr.returns_to_go, dtype=np.float32).reshape(-1)[si:end]
 
-            # 🔑 unify dimensions across tasks
-            o = pad_obs_to_dim(o, obs_dim)         # [L, obs_dim]
-            a = pad_actions_to_dim(a, act_dim)     # [L, act_dim]
+            obs_b[b, pad:, :] = obs
+            act_b[b, pad:, :] = act
+            rtg_b[b, pad:, 0] = rtg
+            ts_b[b, pad:] = np.arange(si, si + tlen, dtype=np.int64)
+            mask_b[b, pad:] = True
 
-            L = a.shape[0]
-            pad = seq_len - L
-
-            mask = _np.zeros(seq_len, dtype=_np.float32)
-
-            if pad > 0:
-                # pad at the END in time dimension
-                o = _np.pad(o, ((0, pad), (0, 0)), mode="constant")
-                a = _np.pad(a, ((0, pad), (0, 0)), mode="constant")
-                rtg = _np.pad(rtg, (0, pad), mode="constant")
-                ts = _np.pad(ts, (0, pad), mode="constant")
-                mask[:L] = 1.0
-            else:
-                mask[:] = 1.0
-
-            B_obs.append(o)
-            B_actions.append(a)
-            B_rtg.append(rtg[:, None])
-            B_ts.append(ts)
-            B_mask.append(mask)
-
-        obs = torch.tensor(_np.stack(B_obs), dtype=torch.float32, device=device)
-        actions = torch.tensor(_np.stack(B_actions), dtype=torch.float32, device=device)
-        rtg = torch.tensor(_np.stack(B_rtg), dtype=torch.float32, device=device)
-        ts = torch.tensor(_np.stack(B_ts), dtype=torch.long, device=device)
-        mask = torch.tensor(_np.stack(B_mask), dtype=torch.float32, device=device)
-
-        yield obs, actions, rtg, ts, mask
-
-
-
-
-def pad_actions_to_dim(actions: np.ndarray, act_dim: int) -> np.ndarray:
-    """
-    actions: [T, D], act_dim: target dimension (e.g. 4)
-
-    Returns [T, act_dim], padding with zeros if D < act_dim.
-    """
-    T, D = actions.shape
-    if D == act_dim:
-        return actions.astype(np.float32)
-
-    out = np.zeros((T, act_dim), dtype=np.float32)
-    out[:, :min(D, act_dim)] = actions[:, :min(D, act_dim)]
-    return out
-
-
-def pad_obs_to_dim(obs: np.ndarray, obs_dim: int) -> np.ndarray:
-    """
-    obs: [T, D], obs_dim: target observation dimension.
-
-    Returns [T, obs_dim], padding with zeros if D < obs_dim
-    or truncating if D > obs_dim.
-    """
-    T, D = obs.shape
-    if D == obs_dim:
-        return obs.astype(np.float32)
-
-    out = np.zeros((T, obs_dim), dtype=np.float32)
-    out[:, :min(D, obs_dim)] = obs[:, :min(D, obs_dim)]
-    return out
+        yield (
+            torch.from_numpy(obs_b).to(dev),
+            torch.from_numpy(act_b).to(dev),
+            torch.from_numpy(rtg_b).to(dev),
+            torch.from_numpy(ts_b).to(dev),
+            torch.from_numpy(mask_b).to(dev),
+        )
