@@ -1,97 +1,34 @@
 from __future__ import annotations
 
 import random
-from typing import List, Tuple, Optional, Any
+from typing import List, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from dt.dataset import Trajectory, make_minibatches
-from dt.dataset_panda import make_minibatches_panda
 from dt.panda_dt import PandaDecisionTransformer
 from .base import BaseStrategy
+from .utils import (
+    make_panda_loader,
+    masked_mse,
+    prepare_panda_trajs,
+    unpack_batch_continuous,
+    unpack_batch_discrete,
+)
 
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def _unpack_batch(batch: Tuple[Any, ...]):
-    """
-    Accepts both:
-      - (obs, actions, rtg, ts, mask)
-      - (obs, actions, rtg, ts)   -> mask derived from actions != -1
-    """
-    if len(batch) == 5:
-        obs, actions, rtg, ts, mask = batch
-    elif len(batch) == 4:
-        obs, actions, rtg, ts = batch
-        # derive mask from padding in actions
-        if isinstance(actions, torch.Tensor):
-            mask = actions.ne(-1)
-        else:
-            # very defensive fallback (should not happen in your pipeline)
-            mask = torch.tensor(actions != -1, device=obs.device, dtype=torch.bool)
-    else:
-        raise ValueError(f"Unexpected batch tuple length={len(batch)}. Expected 4 or 5.")
-
-    # ensure mask is bool tensor on same device
-    if not isinstance(mask, torch.Tensor):
-        mask = torch.tensor(mask, device=obs.device, dtype=torch.bool)
-    else:
-        mask = mask.to(device=obs.device, dtype=torch.bool)
-
-    return obs, actions, rtg, ts, mask
-
-
-def _masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    """
-    pred/target: [B,L,D]
-    mask: [B,L] bool
-    """
-    mse_per_step = ((pred - target) ** 2).mean(dim=-1)  # [B,L]
-    m = mask.float()
-    denom = m.sum().clamp(min=1.0)
-    return (mse_per_step * m).sum() / denom
-
-
-def _make_panda_loader(
-    trajs: List[Trajectory],
-    seq_len: int,
-    batch_size: int,
-    device: str,
-    *,
-    obs_dim: Optional[int] = None,
-    act_dim: Optional[int] = None,
-):
-    """
-    make_minibatches_panda w Twoich wersjach bywa w 2 wariantach sygnatury:
-      - make_minibatches_panda(trajs, seq_len, batch_size, device)
-      - make_minibatches_panda(trajs, seq_len=..., batch_size=..., device=..., obs_dim=..., act_dim=...)
-    """
-    try:
-        # newer / explicit
-        return make_minibatches_panda(
-            trajs,
-            seq_len=seq_len,
-            batch_size=batch_size,
-            device=device,
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-        )
-    except TypeError:
-        # older / positional
-        return make_minibatches_panda(trajs, seq_len, batch_size, device)
-
-
-# ============================================================
-# Atari / Discrete DT (CL) - cumulative replay
-# ============================================================
 
 class CumulativeReplayStrategy(BaseStrategy):
     """
     Discrete-action cumulative replay for Atari DT.
-    IMPORTANT: For DT token order (R,s,a) you feed actions AS-IS (no shift).
+
+    Important:
+      - aligned actions (no torch.roll),
+      - attention mask comes from the shared discrete batch helper,
+      - replay memory stores trajectories and mixes them into every batch,
+      - if replay is empty, the current task uses the FULL batch_size
+        (instead of shrinking it by `mix`).
     """
 
     def __init__(self, *args, rehearsal_capacity: int = 500, **kwargs):
@@ -106,14 +43,27 @@ class CumulativeReplayStrategy(BaseStrategy):
         batch_size: int = 64,
         mix: float = 0.3,
     ):
-        # split batch
-        main_bs = max(1, int(round(batch_size * (1.0 - mix))))
-        reh_bs = batch_size - main_bs
+        mix = max(0.0, min(1.0, float(mix)))
+
+        # If replay is empty, do NOT shrink the main batch.
+        have_replay = (len(self.rehearsal) > 0) and (mix > 0.0)
+
+        if not have_replay:
+            main_bs = int(batch_size)
+            reh_bs = 0
+        else:
+            main_bs = max(1, int(round(batch_size * (1.0 - mix))))
+            reh_bs = max(0, int(batch_size) - main_bs)
+
+        print(
+            f"[cumulative-atari] steps={int(steps)} batch_size={int(batch_size)} mix={mix:.2f} "
+            f"-> main_bs={main_bs} reh_bs={reh_bs} rehearsal={len(self.rehearsal)}"
+        )
 
         loader_task = make_minibatches(task_trajs, self.seq_len, main_bs, self.device)
         loader_reh = (
             make_minibatches(self.rehearsal, self.seq_len, reh_bs, self.device)
-            if (self.rehearsal and reh_bs > 0)
+            if (have_replay and reh_bs > 0)
             else None
         )
 
@@ -125,19 +75,19 @@ class CumulativeReplayStrategy(BaseStrategy):
             ts_list = []
             mask_list = []
 
-            # current task batch
+            # current-task batch
             b = next(loader_task)
-            obs, actions, rtg, ts, mask = _unpack_batch(b)
+            obs, actions, rtg, ts, mask = unpack_batch_discrete(b)
             obs_list.append(obs)
             act_list.append(actions)
             rtg_list.append(rtg)
             ts_list.append(ts)
             mask_list.append(mask)
 
-            # rehearsal batch
+            # replay batch (if available)
             if loader_reh is not None:
                 b = next(loader_reh)
-                obs, actions, rtg, ts, mask = _unpack_batch(b)
+                obs, actions, rtg, ts, mask = unpack_batch_discrete(b)
                 obs_list.append(obs)
                 act_list.append(actions)
                 rtg_list.append(rtg)
@@ -150,9 +100,7 @@ class CumulativeReplayStrategy(BaseStrategy):
             ts = torch.cat(ts_list, dim=0)
             mask = torch.cat(mask_list, dim=0)
 
-            # ✅ actions AS-IS (no roll); pass attention_mask
-            logits = self.model(obs, actions, rtg, ts, attention_mask=mask)  # [B,L,A]
-
+            logits = self.model(obs, actions, rtg, ts, attention_mask=mask)
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.size(-1)),
                 actions.reshape(-1),
@@ -161,20 +109,18 @@ class CumulativeReplayStrategy(BaseStrategy):
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.opt.step()
 
         return {}
 
     def after_task(self, task_trajs: List[Trajectory]):
+        # Simple cumulative buffer:
+        # keep old + new, shuffle, truncate to capacity.
         pool = list(self.rehearsal) + list(task_trajs)
         random.shuffle(pool)
         self.rehearsal = pool[: self.rehearsal_capacity]
 
-
-# ============================================================
-# Panda / Continuous DT (CL) - cumulative replay
-# ============================================================
 
 class PandaCumulativeReplayStrategy:
     """
@@ -190,48 +136,88 @@ class PandaCumulativeReplayStrategy:
         device: str,
         d_model: int = 128,
         n_layers: int = 3,
-        n_heads: int = 4,
+        n_heads: int = 1,
         p_drop: float = 0.1,
-        lr: float = 3e-4,
+        lr: float = 1e-4,
         weight_decay: float = 1e-4,
-        rehearsal_capacity: int = 500,
+        grad_clip: float = 0.25,
+        rehearsal_capacity: int = 5000,
+        max_ep_len: int = 50,
+        rtg_scale: float = 1000.0,
     ):
         self.seq_len = int(seq_len)
-        self.device = str(device)
+        self.device = torch.device(str(device))
         self.rehearsal_capacity = int(rehearsal_capacity)
         self.rehearsal: List[Trajectory] = []
+        self.n_seen_trajs = 0
 
-        obs_dim = int(obs_shape[0])
-        self.obs_dim = obs_dim
+        self.obs_dim = int(obs_shape[0])
         self.act_dim = int(act_dim)
+        self.grad_clip = float(grad_clip)
+
+        self.model_hparams = {
+            "obs_dim": self.obs_dim,
+            "act_dim": self.act_dim,
+            "seq_len": int(seq_len),
+            "d_model": int(d_model),
+            "n_layers": int(n_layers),
+            "n_heads": int(n_heads),
+            "p_drop": float(p_drop),
+            "max_ep_len": int(max_ep_len),
+            "rtg_scale": float(rtg_scale),
+            "lr": float(lr),
+            "weight_decay": float(weight_decay),
+            "grad_clip": float(grad_clip),
+            "rehearsal_capacity": int(rehearsal_capacity),
+        }
 
         self.model = PandaDecisionTransformer(
-            obs_dim=obs_dim,
+            obs_dim=self.obs_dim,
             act_dim=self.act_dim,
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
+            d_model=int(d_model),
+            n_layers=int(n_layers),
+            n_heads=int(n_heads),
             seq_len=self.seq_len,
-            p_drop=p_drop,
+            p_drop=float(p_drop),
+            max_ep_len=int(max_ep_len),
+            rtg_scale=float(rtg_scale),
         ).to(self.device)
 
         self.opt = torch.optim.AdamW(
             self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=float(lr),
+            weight_decay=float(weight_decay),
         )
+
+    def _prepare_trajs(self, trajs: List[Trajectory]) -> List[Trajectory]:
+        return prepare_panda_trajs(trajs, obs_dim=self.obs_dim, act_dim=self.act_dim)
 
     def train_task(
         self,
         task_trajs: List[Trajectory],
         steps: int = 2000,
-        batch_size: int = 64,
-        mix: float = 0.3,
+        batch_size: int = 128,
+        mix: float = 0.5,
     ):
-        main_bs = max(1, int(round(batch_size * (1.0 - mix))))
-        reh_bs = batch_size - main_bs
+        mix = float(np.clip(mix, 0.0, 1.0))
 
-        loader_task = _make_panda_loader(
+        task_trajs = self._prepare_trajs(task_trajs)
+        replay_trajs = self.rehearsal if self.rehearsal else []
+
+        have_replay = (len(replay_trajs) > 0) and (mix > 0.0)
+        if not have_replay:
+            main_bs = int(batch_size)
+            reh_bs = 0
+        else:
+            main_bs = max(1, int(round(batch_size * (1.0 - mix))))
+            reh_bs = max(0, int(batch_size) - main_bs)
+
+        print(
+            f"[cumulative] steps={int(steps)} batch_size={int(batch_size)} mix={mix:.2f} "
+            f"-> main_bs={main_bs} reh_bs={reh_bs} rehearsal={len(self.rehearsal)}"
+        )
+
+        loader_task = make_panda_loader(
             task_trajs,
             seq_len=self.seq_len,
             batch_size=main_bs,
@@ -239,62 +225,53 @@ class PandaCumulativeReplayStrategy:
             obs_dim=self.obs_dim,
             act_dim=self.act_dim,
         )
+
         loader_reh = (
-            _make_panda_loader(
-                self.rehearsal,
+            make_panda_loader(
+                replay_trajs,
                 seq_len=self.seq_len,
                 batch_size=reh_bs,
                 device=self.device,
                 obs_dim=self.obs_dim,
                 act_dim=self.act_dim,
             )
-            if (self.rehearsal and reh_bs > 0)
+            if (have_replay and reh_bs > 0)
             else None
         )
 
         self.model.train()
         for _ in range(int(steps)):
-            obs_list = []
-            act_list = []
-            rtg_list = []
-            ts_list = []
-            mask_list = []
-
             b = next(loader_task)
-            obs, actions, rtg, ts, mask = _unpack_batch(b)
-            obs_list.append(obs)
-            act_list.append(actions)
-            rtg_list.append(rtg)
-            ts_list.append(ts)
-            mask_list.append(mask)
+            obs, actions, rtg, ts, mask = unpack_batch_continuous(b)
 
             if loader_reh is not None:
-                b = next(loader_reh)
-                obs, actions, rtg, ts, mask = _unpack_batch(b)
-                obs_list.append(obs)
-                act_list.append(actions)
-                rtg_list.append(rtg)
-                ts_list.append(ts)
-                mask_list.append(mask)
+                b2 = next(loader_reh)
+                obs2, actions2, rtg2, ts2, mask2 = unpack_batch_continuous(b2)
+                obs = torch.cat([obs, obs2], dim=0)
+                actions = torch.cat([actions, actions2], dim=0)
+                rtg = torch.cat([rtg, rtg2], dim=0)
+                ts = torch.cat([ts, ts2], dim=0)
+                mask = torch.cat([mask, mask2], dim=0)
 
-            obs = torch.cat(obs_list, dim=0)
-            actions = torch.cat(act_list, dim=0)
-            rtg = torch.cat(rtg_list, dim=0)
-            ts = torch.cat(ts_list, dim=0)
-            mask = torch.cat(mask_list, dim=0)
-
-            # ✅ Continuous: feed actions AS-IS, use mask
-            pred = self.model(obs, actions, rtg, ts, attention_mask=mask)  # [B,L,act_dim]
-            loss = _masked_mse(pred, actions, mask)
+            pred = self.model(obs, actions, rtg, ts, attention_mask=mask)
+            loss = masked_mse(pred, actions, mask)
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.opt.step()
 
         return {}
 
     def after_task(self, task_trajs: List[Trajectory]):
-        pool = list(self.rehearsal) + list(task_trajs)
-        random.shuffle(pool)
-        self.rehearsal = pool[: self.rehearsal_capacity]
+        task_trajs = self._prepare_trajs(task_trajs)
+
+        for tr in task_trajs:
+            self.n_seen_trajs += 1
+
+            if len(self.rehearsal) < self.rehearsal_capacity:
+                self.rehearsal.append(tr)
+            else:
+                j = random.randint(0, self.n_seen_trajs - 1)
+                if j < self.rehearsal_capacity:
+                    self.rehearsal[j] = tr

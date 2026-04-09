@@ -216,7 +216,7 @@ python analyze_runs.py --run-dir runs/20251128-152557/atari/cumulative/specs_ata
 
 Panda (example; path depends on timestamp and strategy):
 ```bash
-python analyze_runs.py --run-dir runs/20251122-151458/panda/cumulative/panda3
+python analyze_runs.py --run-dir runs/20260406-211003/atari/tsn_improved_reuse/specs_atari_cl_5_minari_like_breakout_first__dm128_L3_H4_K20_drop0.10__rsm-hybrid_hthr0.5_ha0.70
 ```
 
 ---
@@ -231,3 +231,59 @@ Generate Atari expert dataset in DT `.npz` format from Minari:
 python bin/generate_atari_traj_from_mintari.py --config configs/specs_atari_cl_5_minari_like.json --out-root /net/tscratch/people/plgdomin088/datasets/atari_expert --max-len 50000 --obs-dtype float32
 ```
 ---
+
+
+
+# TSN -> Atari DT integration notes
+
+## What this version does
+
+This is a pragmatic `TSNStrategy` for your offline Atari Decision Transformer flow.
+It implements:
+
+- trainable score masks on `nn.Conv2d`, `nn.Linear`, and optionally `nn.Embedding`
+- one binary mask per task
+- freezing of already-occupied parameters from previous tasks
+- optional reuse of occupied weights (`allow_weight_reuse`)
+- post-task KMeans quantization of newly claimed weights only
+
+## What is intentionally missing for now
+
+- KL-based task similarity check / model duplication
+- replay-memory based sharing decisions
+- greedy post-training pruning search
+- paper-style exact capacity accounting
+
+## Important defaults
+
+Recommended starting defaults for Atari:
+
+- `keep_ratio=0.5`
+- `allow_weight_reuse=False`
+- `include_embeddings=True`
+- `skip_module_names=("dt.te",)`
+- `freeze_non_mask_params_after_first=True`
+
+Why skip `dt.te` first?
+Because the time embedding is large and shared across tasks; leaving it dense/frozen makes the first Atari port more stable.
+The action embedding `dt.ae` is still converted to TSN when embeddings are enabled.
+
+## Very important detail
+
+This port reinitializes score tensors before each new task.
+That is necessary because task-specific masks are stored explicitly after each task, so score tensors must be free to learn a fresh subnetwork for the next task.
+
+## Evaluation caveat
+
+For TSN-like methods, `task_id` matters.
+So in your CL matrix the lower triangle is the meaningful one.
+Evaluating unseen future tasks before their mask exists is not very informative.
+
+```bash
+python bin/clb-run-dt.py  --strategy tsn --spec configs/specs_atari_cl_5_minari_like.json --dataset-root /net/tscratch/people/plgdomin088/datasets/atari_expert --atari-env minari_like  --seq-len 20 --steps-per-task 2000 --batch-size 64 --target-mode max  --tsn-keep-ratio 0.5 --tsn-quant-clusters 16 --tsn-skip-module dt.te --tsn-keep-schedule equal_remaining --tsn-min-keep-ratio 1e-3 --tsn-grad-clip 1.0
+```
+
+
+```bash
+python run_panda_cl.py --strategy tsn --tag panda3_tsn --seq-len 20 --steps-per-task 1000000 --episodes-eval 20 --max-steps 50 --device cuda -batch-size 128 -d-model 128 -n-layers 3 -n-heads 1 --p-drop 0.1 --lr 1e-4 --weight-decay 1e-4 --grad-clip 0.25 -max-ep-len 50 --rtg-scale 1000.0 \-tsn-keep-ratio 0.5 --tsn-quant-clusters 16
+```

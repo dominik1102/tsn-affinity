@@ -222,7 +222,7 @@ def main():
     ap.add_argument("--debug-episode", type=int, default=0)
     ap.add_argument("--debug-only", action="store_true")
 
-    # Zostawiamy flagi kompatybilności, ale auto-fire włączamy tylko heurystycznie (Breakout)
+    # Keep compatibility flags, but enable auto-fire only heuristically (Breakout)
     ap.add_argument("--auto-fire", action="store_true")
     ap.add_argument("--auto-fire-on-life-loss", action="store_true")
 
@@ -304,7 +304,7 @@ def main():
                 print(f"[data] after remap ep0 replay: {ds0:.2f} == {env1:.2f}")
             else:
                 print(f"[warn] ep0 replay mismatch: dataset={ds0:.2f} env={env0:.2f}")
-                print("[warn] To zwykle znaczy: env != dataset (preprocess/wrappers/frameskip/sticky/noop).")
+                print("[warn] This usually means: env != dataset (preprocess/wrappers/frameskip/sticky/noop).")
 
         # ---- build model ----
         obs_shape = env.observation_space.shape
@@ -337,7 +337,7 @@ def main():
             seq_len=args.seq_len,
         )
 
-        # ---- eval (STABILNE: forward, seedowane) ----
+        # ---- eval (STABLE: forward, seeded) ----
         model.eval()
         if args.target_return is not None:
             target = float(args.target_return)
@@ -374,8 +374,8 @@ def main():
             device=device,
             max_steps=args.max_ep_len,
             target_return=target,
-            seed=seed,                     # ✅ deterministyczne epizody: seed+ep
-            greedy=True,                   # ✅ stabilne (argmax)
+            seed=seed,                     # ✅ deterministic episodes: seed+ep
+            greedy=True,                   # ✅ stable (argmax)
             clamp_to_env_actions=True,
             auto_fire=auto_fire_eff,
             auto_fire_on_life_loss=auto_fire_life_eff,

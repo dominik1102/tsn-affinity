@@ -175,7 +175,7 @@ def sanity_checks(task_name: str, npz_path: str, data: Dict[str, np.ndarray], ob
     rmin, rmax = float(rewards.min()), float(rewards.max())
     print(f"[check] rewards min/max: {rmin:.3f} / {rmax:.3f}")
     if rmin < -1.0001 or rmax > 1.0001:
-        print("[WARN] reward values outside [-1,1]. Jeśli spodziewasz się clip_rewards=True, to coś się rozjechało.")
+        print("[WARN] reward values outside [-1,1]. If you expected clip_rewards=True, something is off.")
 
     # action range
     amin, amax = int(actions.min()), int(actions.max())
@@ -193,7 +193,7 @@ def sanity_checks(task_name: str, npz_path: str, data: Dict[str, np.ndarray], ob
     n_last_done_true = int(np.sum(last_done.astype(np.int32)))
     print(f"[check] episodes with last done=True: {n_last_done_true}/{len(lengths)}")
     if n_last_done_true < len(lengths):
-        print("[WARN] Niektóre epizody kończą się bez done=True na ostatnim kroku -> najpewniej ucięte max_len.")
+        print("[WARN] Some episodes end without done=True on the last step -> likely truncated at max_len.")
 
     early_done_eps = 0
     for i, (s, e) in enumerate(zip(starts, ends)):
@@ -204,14 +204,14 @@ def sanity_checks(task_name: str, npz_path: str, data: Dict[str, np.ndarray], ob
             early_done_eps += 1
     print(f"[check] episodes with early done=True (before last step): {early_done_eps}/{len(lengths)}")
     if early_done_eps > 0:
-        print("[WARN] Wewnątrz epizodu pojawia się done=True przed końcem. Dla Waszego collectora to zwykle nie powinno się zdarzać.")
+        print("[WARN] Some episodes contain done=True before the last step. For your collector this usually should not happen.")
 
     # --- observations metadata check (no full load) ---
     try:
         obs_shape, obs_dtype, _, _ = read_npy_header_from_npz(npz_path, "observations")
         print(f"[check] observations header: shape={obs_shape}, dtype={obs_dtype}")
         if len(obs_shape) != 4:
-            print("[WARN] observations nie mają kształtu [T,C,H,W].")
+            print("[WARN] observations do not have shape [T,C,H,W].")
     except Exception as e:
         print(f"[WARN] Could not read observations header: {e}")
 
@@ -228,10 +228,10 @@ def sanity_checks(task_name: str, npz_path: str, data: Dict[str, np.ndarray], ob
 
                 if np.issubdtype(sample.dtype, np.floating):
                     if smin < -1e-3 or smax > 1.0 + 1e-3:
-                        print("[WARN] Obs sample wygląda na poza zakresem [0,1] dla floatów.")
+                        print("[WARN] Obs sample appears outside [0,1] range for floats.")
                 elif sample.dtype == np.uint8:
                     if smin < 0 or smax > 255:
-                        print("[WARN] Obs sample wygląda na poza zakresem [0,255] dla uint8.")
+                        print("[WARN] Obs sample appears outside [0,255] range for uint8.")
         except Exception as e:
             print(f"[WARN] Could not sample observations: {e}")
 
@@ -307,7 +307,7 @@ def main():
         sanity_checks(task_name, npz_path, data, obs_sample_n=int(args.obs_sample))
 
     if any_missing:
-        print("\n[hint] Sprawdź czy export poszedł do tego samego --root i czy nazwy folderów tasków się zgadzają.")
+        print("\n[hint] Check that export went to the same --root and that task folder names match.")
 
 
 if __name__ == "__main__":

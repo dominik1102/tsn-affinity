@@ -73,8 +73,9 @@ class CausalSelfAttention(nn.Module):
                 if attn_mask.dim() != 2:
                     raise ValueError(f"attn_mask must be [B,T] bool, got {attn_mask.shape}")
                 keep = attn_mask[:, None, None, :]  # [B,1,1,T]
+                neg = torch.finfo(q.dtype).min  # skończone, nie -inf
                 float_mask = torch.zeros((B, 1, 1, T), device=x.device, dtype=q.dtype)
-                float_mask = float_mask.masked_fill(~keep, float("-inf"))
+                float_mask = float_mask.masked_fill(~keep, neg)
 
             y = F.scaled_dot_product_attention(
                 q, k, v,
@@ -329,12 +330,6 @@ class ObsEncoder(nn.Module):
             return self.net(x)
         z = self.cnn(x)
         return self.proj(z)
-from dataclasses import dataclass
-from typing import Optional
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
 
 @dataclass
 class DTConfig:

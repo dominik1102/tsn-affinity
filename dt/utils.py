@@ -12,7 +12,7 @@ from dt.model import DecisionTransformer
 
 
 # ============================================================
-# Minari Atari env spec (z dokumentacji Minari expert-v0)
+# Minari Atari env spec (from Minari expert-v0 docs)
 # ALE/<Game>-v5, obs_type=rgb, frameskip=4, repeat_action_probability=0, no wrappers
 # ============================================================
 
@@ -86,7 +86,7 @@ def _preprocess_frame_dqn_hw01(frame_rgb: np.ndarray, dqn_size: int = 84) -> np.
 class MinariDQNStackWrapper(gym.Wrapper):
     """
     Wrapper: RGB obs -> gray84 float -> stack4 => CHW float32 in [0,1].
-    Nie robi frameskip (bo Minari env ma frameskip=4 w base env).
+    Does not perform frameskip (Minari base env has frameskip=4).
     """
 
     def __init__(self, env: gym.Env, frame_stack: int = 4, dqn_size: int = 84, clip_rewards: bool = True):
@@ -131,9 +131,9 @@ def make_minari_atari_env(
     clip_rewards: bool = True,
 ) -> gym.Env:
     """
-    Env zgodny z Minari expert-v0:
-      - base ALE/<Game>-v5 z frameskip=4, repeat_action_probability=0, obs_type=rgb
-      - wrapper robi tylko preprocess + stack (bez dodatkowego frame_skip!)
+    Env compatible with Minari expert-v0:
+      - base ALE/<Game>-v5 with frameskip=4, repeat_action_probability=0, obs_type=rgb
+      - wrapper only does preprocess + stack (no additional frame_skip)
     """
     kwargs = dict(MINARI_ATARI_KWARGS_BASE)
     kwargs["game"] = _game_slug(env_id)
@@ -234,7 +234,7 @@ def make_offline_minibatches(
                     start, end, length = 0, L, L
 
                 obs_slice = episodes_obs[ep_idx][start:end].astype(np.float32, copy=False)
-                # dataset jest już float[0,1] z exportu; ale gdyby było uint8:
+                # dataset is already float[0,1] from the export; but if it was uint8:
                 if obs_slice.dtype == np.uint8 or (obs_slice.size > 0 and obs_slice.max() > 1.5):
                     obs_slice = obs_slice.astype(np.float32) / 255.0
 
@@ -276,8 +276,8 @@ def debug_replay_episode(
     seed: Optional[int] = 0,
 ) -> float:
     """
-    Replays EXACT action sequence (bez auto-fire!) i zwraca env_return.
-    Jak env jest zgodny z Minari, powinno wyjść ~dataset_return (deterministycznie).
+    Replays EXACT action sequence (no auto-fire!) and returns env_return.
+    If the env is compatible with Minari, this should match ~dataset_return (deterministically).
     """
     obs, info = env.reset(seed=seed)
     total = 0.0
@@ -290,15 +290,15 @@ def debug_replay_episode(
 
 def _stack_motion(obs) -> float:
     """
-    Breakout: piłka to kilka pikseli -> mean(diff) bywa <1e-4.
-    Używamy max(diff), żeby pewnie wykryć ruch.
-    Obsłuży też układ (S,H,W) i (H,W,S).
+    Breakout: the ball is only a few pixels -> mean(diff) can be <1e-4.
+    We use max(diff) to reliably detect motion.
+    Also handles layout (S,H,W) and (H,W,S).
     """
     a = np.asarray(obs, dtype=np.float32)
     if a.ndim != 3:
         return 0.0
 
-    # normalizacja jeśli uint8
+    # normalize if uint8
     if a.max() > 1.5:
         a = a / 255.0
 
@@ -330,7 +330,7 @@ def _robust_fire_after_reset(env: gym.Env, fire_a: int, max_tries: int = 20):
             obs, info = env.reset()
             continue
 
-        # daj 1 tick na “ruch piłki”
+        # give 1 tick for 'ball movement'
         obs, r, terminated, truncated, info = env.step(int(noop_a))
         if terminated or truncated:
             obs, info = env.reset()
@@ -596,31 +596,63 @@ def evaluate_dt_panda(
     clip_action: bool = True,
     gamma: float = 1.0,
     rtg_clip: Optional[Tuple[Optional[float], Optional[float]]] = None,  # (min,max)
+    *,
+    unwrap_flatten_observation: bool = True,
+    obs_keys: Optional[Tuple[str, ...]] = None,
+    use_prev_action: bool = True,
+    timestep_clip_max: Optional[int] = None,
 ) -> float:
     """
-    Roll out PandaDecisionTransformer in PandaGym (continuous actions).
+    Panda (continuous actions) evaluation.
+
+    Notes:
+      - obs_keys can be passed from the loader/runner so train and eval use identical flatten order,
+      - use_prev_action allows an ablation: whether prev_action helps or hurts,
+      - timestep_clip_max prevents stepping beyond timesteps seen during training,
+      - if env is FlattenObservation, we can unwrap and flatten observations ourselves.
     """
 
-    # allow passing a strategy wrapper
+    # allow wrappers like strategy/model.model
     if (not hasattr(model, "act")) and hasattr(model, "model"):
         model = model.model
     if not hasattr(model, "act"):
-        raise AttributeError("evaluate_dt_panda: `model` must implement `.act(obs, rtg_scalar, t, ...)`")
+        raise AttributeError("evaluate_dt_panda: `model` must implement `.act(obs, rtg_scalar, t, prev_action=...)`")
+
     if gamma <= 0:
         raise ValueError(f"gamma must be > 0, got {gamma}")
 
-    # Default max_steps (IMPORTANT)
-    if max_steps is None:
-        max_steps = getattr(getattr(env, "spec", None), "max_episode_steps", None)
-    if max_steps is None:
-        max_steps = 200  # safe fallback (not 20)
+    rollout_env = env
+    if unwrap_flatten_observation:
+        try:
+            from gymnasium.wrappers import FlattenObservation  # type: ignore
+            if isinstance(env, FlattenObservation):
+                rollout_env = env.env
+        except Exception:
+            if env.__class__.__name__ == "FlattenObservation" and hasattr(env, "env"):
+                rollout_env = env.env
 
-    if not isinstance(env.action_space, gym.spaces.Box):
-        raise ValueError(f"evaluate_dt_panda expects Box action space, got: {type(env.action_space)}")
+    if max_steps is None:
+        max_steps = getattr(getattr(rollout_env, "spec", None), "max_episode_steps", None)
+    if max_steps is None:
+        max_steps = 50
 
-    env_act_dim = int(np.prod(env.action_space.shape))
-    low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
-    high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+    if not isinstance(rollout_env.action_space, gym.spaces.Box):
+        raise ValueError(f"evaluate_dt_panda expects Box action space, got: {type(rollout_env.action_space)}")
+
+    env_act_dim = int(np.prod(rollout_env.action_space.shape))
+    low = np.asarray(rollout_env.action_space.low, dtype=np.float32).reshape(-1)
+    high = np.asarray(rollout_env.action_space.high, dtype=np.float32).reshape(-1)
+
+    model_act_dim = getattr(model, "act_dim", None)
+    if model_act_dim is not None:
+        model_act_dim = int(model_act_dim)
+
+    obs_keys_local = obs_keys
+    if obs_keys_local is None and isinstance(rollout_env.observation_space, gym.spaces.Dict):
+        obs_keys_local = tuple(rollout_env.observation_space.spaces.keys())
+
+    if timestep_clip_max is not None:
+        timestep_clip_max = max(0, int(timestep_clip_max))
 
     def _pad_or_trunc(x: np.ndarray, size: Optional[int]) -> np.ndarray:
         x = np.asarray(x, dtype=np.float32).reshape(-1)
@@ -633,67 +665,201 @@ def evaluate_dt_panda(
             return x[:size]
         return x
 
-    returns = []
+    def _flatten_obs(obs) -> np.ndarray:
+        if isinstance(obs, dict):
+            if obs_keys_local is not None and all(k in obs for k in obs_keys_local):
+                parts = [np.asarray(obs[k], dtype=np.float32).ravel() for k in obs_keys_local]
+                return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+
+            from gymnasium.spaces.utils import flatten as gym_flatten
+            return gym_flatten(rollout_env.observation_space, obs).astype(np.float32, copy=False)
+
+        return np.asarray(obs, dtype=np.float32).reshape(-1)
+
+    returns: List[float] = []
+
+    try:
+        model.eval()
+    except Exception:
+        pass
 
     for ep in range(int(episodes)):
         if hasattr(model, "reset_history") and callable(getattr(model, "reset_history")):
             model.reset_history()
 
         if seed is None:
-            obs, info = env.reset()
+            obs, info = rollout_env.reset()
         else:
-            obs, info = env.reset(seed=int(seed + ep))
+            obs, info = rollout_env.reset(seed=int(seed + ep))
 
         total = 0.0
         rtg = float(target_return)
+        prev_action = None
 
         for t in range(int(max_steps)):
-            # flatten dict obs if needed
-            if isinstance(obs, dict):
-                from gymnasium.spaces.utils import flatten as gym_flatten
-                obs_vec = gym_flatten(env.observation_space, obs)
-            else:
-                obs_vec = obs
-
+            obs_vec = _flatten_obs(obs)
             obs_vec = _pad_or_trunc(obs_vec, obs_pad_to)
 
-            a = model.act(
+            t_model = int(t)
+            if timestep_clip_max is not None:
+                t_model = min(t_model, int(timestep_clip_max))
+
+            a_pred = model.act(
                 obs_vec,
                 rtg_scalar=rtg,
-                t=int(t),
+                t=t_model,
+                prev_action=(prev_action if use_prev_action else None),
                 device=str(device),
             )
+            a_pred = _pad_or_trunc(a_pred, act_pad_to)
 
-            a = _pad_or_trunc(a, act_pad_to)
-
-            # adapt to env act dim
-            if a.size < env_act_dim:
-                a_env = np.pad(a, (0, env_act_dim - a.size), mode="constant")
+            if a_pred.size < env_act_dim:
+                a_env_flat = np.pad(a_pred, (0, env_act_dim - a_pred.size), mode="constant")
             else:
-                a_env = a[:env_act_dim]
+                a_env_flat = a_pred[:env_act_dim]
 
             if clip_action:
-                a_env = np.clip(a_env, low[:env_act_dim], high[:env_act_dim])
+                a_env_flat = np.clip(a_env_flat, low[:env_act_dim], high[:env_act_dim])
 
-            a_env = a_env.astype(np.float32, copy=False).reshape(env.action_space.shape)
+            a_env = a_env_flat.astype(np.float32, copy=False).reshape(rollout_env.action_space.shape)
 
-            obs, r, terminated, truncated, info = env.step(a_env)
+            obs, r, terminated, truncated, info = rollout_env.step(a_env)
             r = float(r)
             total += r
 
-            # RTG update consistent with returns_to_go definition
+            if use_prev_action:
+                pa = a_env_flat.reshape(-1).astype(np.float32, copy=False)
+                if model_act_dim is not None:
+                    prev_action = _pad_or_trunc(pa, model_act_dim)
+                else:
+                    prev_action = pa
+            else:
+                prev_action = None
+
             if gamma == 1.0:
                 rtg = rtg - r
             else:
                 rtg = (rtg - r) / float(gamma)
 
-            # optional clamp
             if rtg_clip is not None:
                 lo, hi = rtg_clip
                 if lo is not None:
                     rtg = max(rtg, float(lo))
                 if hi is not None:
                     rtg = min(rtg, float(hi))
+
+            if terminated or truncated:
+                break
+
+        returns.append(total)
+
+    return float(np.mean(returns)) if returns else 0.0
+
+
+@torch.no_grad()
+def evaluate_dt_panda_cl(
+    model,
+    env: gym.Env,
+    *,
+    episodes: int,
+    device: torch.device,
+    max_steps: int,
+    target_return: float,
+    seed: int,
+    obs_keys: Tuple[str, ...],
+    obs_pad_to: int,
+    act_pad_to: int,
+    timestep_clip_max: Optional[int],
+    gamma: float = 1.0,
+    clip_action: bool = True,
+) -> float:
+    # unwrap if strategy wrapper
+    if (not hasattr(model, "act")) and hasattr(model, "model"):
+        model = model.model
+    if not hasattr(model, "act"):
+        raise AttributeError("Model must implement .act()")
+
+    if not isinstance(env.action_space, gym.spaces.Box):
+        raise ValueError("Panda eval expects Box action space")
+
+    env_act_dim = int(np.prod(env.action_space.shape))
+    low = np.asarray(env.action_space.low, dtype=np.float32).reshape(-1)
+    high = np.asarray(env.action_space.high, dtype=np.float32).reshape(-1)
+
+    model_act_dim = getattr(model, "act_dim", None)
+    model_act_dim = int(model_act_dim) if model_act_dim is not None else None
+
+    def _pad_or_trunc_1d(x: np.ndarray, size: int) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32).reshape(-1)
+        if x.size < size:
+            return np.pad(x, (0, size - x.size), mode="constant")
+        if x.size > size:
+            return x[:size]
+        return x
+
+    def _flatten_obs(obs: Any) -> np.ndarray:
+        if isinstance(obs, dict):
+            parts = [np.asarray(obs[k], dtype=np.float32).ravel() for k in obs_keys]
+            return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+        return np.asarray(obs, dtype=np.float32).reshape(-1)
+
+    returns: List[float] = []
+    model.eval()
+
+    for ep in range(int(episodes)):
+        if hasattr(model, "reset_history"):
+            model.reset_history()
+
+        obs, info = env.reset(seed=int(seed + ep))
+
+        total = 0.0
+        rtg = float(target_return)
+        prev_action = None
+
+        for t in range(int(max_steps)):
+            obs_vec = _flatten_obs(obs)
+            obs_vec = _pad_or_trunc_1d(obs_vec, int(obs_pad_to))
+
+            t_model = int(t)
+            if timestep_clip_max is not None:
+                t_model = min(t_model, int(timestep_clip_max))
+
+            a_pred = model.act(
+                obs_vec,
+                rtg_scalar=float(rtg),
+                t=int(t_model),
+                prev_action=prev_action,
+                device=str(device),
+            )
+            a_pred = _pad_or_trunc_1d(a_pred, int(act_pad_to))
+
+            # dopasuj do env act dim
+            if a_pred.size < env_act_dim:
+                a_env_flat = np.pad(a_pred, (0, env_act_dim - a_pred.size), mode="constant")
+            else:
+                a_env_flat = a_pred[:env_act_dim]
+
+            if clip_action:
+                a_env_flat = np.clip(a_env_flat, low[:env_act_dim], high[:env_act_dim])
+
+            a_env = a_env_flat.astype(np.float32, copy=False).reshape(env.action_space.shape)
+
+            obs, r, terminated, truncated, info = env.step(a_env)
+            r = float(r)
+            total += r
+
+            # prev_action = executed action (after clip), adjusted to model_act_dim
+            pa = a_env_flat.reshape(-1).astype(np.float32, copy=False)
+            if model_act_dim is not None:
+                prev_action = _pad_or_trunc_1d(pa, model_act_dim)
+            else:
+                prev_action = pa
+
+            # update RTG (as in single)
+            if gamma == 1.0:
+                rtg = rtg - r
+            else:
+                rtg = (rtg - r) / float(gamma)
 
             if terminated or truncated:
                 break

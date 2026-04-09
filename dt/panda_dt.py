@@ -148,30 +148,38 @@ class PandaDecisionTransformer(nn.Module):
 
     @torch.no_grad()
     def act(
-        self,
-        obs,
-        rtg_scalar: float,
-        t: int,
-        prev_action=None,  # kept for compatibility
-        device: str = "cpu",
+            self,
+            obs,
+            rtg_scalar: float,
+            t: int,
+            prev_action=None,  # <-- NOW USED (previous action executed at t-1)
+            device: str = "cpu",
     ) -> np.ndarray:
         self.eval()
         dev = next(self.parameters()).device
 
-        o = self._pad_or_trunc_1d(np.asarray(obs, dtype=np.float32), self.obs_dim)
+        # 1) append executed prev_action (a_{t-1}) if present
+        if prev_action is not None:
+            pa = self._pad_or_trunc_1d(np.asarray(prev_action, dtype=np.float32), self.act_dim)
+            self._hist_actions.append(pa)
 
+        # 2) append current observation and RTG (s_t, R_t)
+        o = self._pad_or_trunc_1d(np.asarray(obs, dtype=np.float32), self.obs_dim)
         self._hist_obs.append(o)
         self._hist_rtgs.append(float(rtg_scalar))
         self._hist_t.append(int(t))
 
-        # keep last seq_len steps
+        # 3) trim to context K (important: keep obs vs actions aligned)
         if len(self._hist_obs) > self.seq_len:
-            self._hist_obs = self._hist_obs[-self.seq_len :]
-            self._hist_rtgs = self._hist_rtgs[-self.seq_len :]
-            self._hist_t = self._hist_t[-self.seq_len :]
-            self._hist_actions = self._hist_actions[-self.seq_len :]
+            n_drop = len(self._hist_obs) - self.seq_len
+            self._hist_obs = self._hist_obs[n_drop:]
+            self._hist_rtgs = self._hist_rtgs[n_drop:]
+            self._hist_t = self._hist_t[n_drop:]
+            # actions correspond to obs[0..-2], so drop the same amount
+            if n_drop > 0:
+                self._hist_actions = self._hist_actions[n_drop:] if len(self._hist_actions) >= n_drop else []
 
-        L = len(self._hist_obs)
+        L = len(self._hist_obs)  # number of states in history (including current)
         K = self.seq_len
         start = K - L  # left pad
 
@@ -186,22 +194,17 @@ class PandaDecisionTransformer(nn.Module):
         ts_seq[0, start:] = torch.tensor(self._hist_t, dtype=torch.long, device=dev).clamp(max=self.max_ep_len - 1)
         mask[0, start:] = True
 
-        # past actions fill up to L-1, last is placeholder
+        # actions history should have length L-1 (a_0..a_{t-1})
         past = self._hist_actions
         if len(past) > (L - 1):
             past = past[-(L - 1):]
 
         for i, a in enumerate(past):
-            a = self._pad_or_trunc_1d(a, self.act_dim)
-            act_seq[0, start + i, :] = torch.from_numpy(a).to(dev)
+            act_seq[0, start + i, :] = torch.from_numpy(self._pad_or_trunc_1d(a, self.act_dim)).to(dev)
 
-        # last action token stays zero (unknown a_t)
+        # last action token (for current step) remains 0 (placeholder)
 
         pred = self.forward(obs_seq, act_seq, rtg_seq, ts_seq, attention_mask=mask)  # [1,K,act_dim]
         a_t = pred[0, -1, :].detach().cpu().numpy().astype(np.float32, copy=False)
-
-        self._hist_actions.append(a_t)
-        if len(self._hist_actions) > self.seq_len:
-            self._hist_actions = self._hist_actions[-self.seq_len :]
 
         return a_t
