@@ -1,0 +1,87 @@
+[
+   {
+    "name": "D_Breakout",
+    "env_id": null,
+    "seed": 0,
+    "params": {
+      "game": "ALE/Breakout-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "A_Alien",
+    "env_id": null,
+    "seed": 1,
+    "params": {
+      "game": "ALE/Alien-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "B_Atlantis",
+    "env_id": null,
+    "seed": 2,
+    "params": {
+      "game": "ALE/Atlantis-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "C_Boxing",
+    "env_id": null,
+    "seed": 3,
+    "params": {
+      "game": "ALE/Boxing-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  },
+  {
+    "name": "E_Centipede",
+    "env_id": null,
+    "seed": 4,
+    "params": {
+      "game": "ALE/Centipede-v5",
+      "frameskip": 4,
+      "noop_max": 30,
+      "sticky_actions": true,
+      "repeat_action_prob": 0.25,
+      "terminal_on_life_loss": true,
+      "clip_rewards": true,
+      "grayscale_obs": true,
+      "scale_obs": false,
+      "frame_stack": 4
+    }
+  }
+]

@@ -1,24 +1,101 @@
 from __future__ import annotations
-from typing import Any, Dict, List
+
+from typing import Any, Dict, List, Iterator, Optional, Sequence, Tuple
 import pickle
 import numpy as np
+import torch
 
 from dt.dataset import Trajectory, discount_cumsum
 
 
-def flatten_panda_step(obs: Dict[str, np.ndarray]) -> np.ndarray:
-    """
-    Flatten single Panda obs dict into 1D vector.
+# -----------------------------------------------------------------------------
+# Obs "extractor" (as in the working pipeline): flatten according to observation_space keys
+# -----------------------------------------------------------------------------
+_DEFAULT_PANDA_KEYS: Tuple[str, ...] = ("observation", "achieved_goal", "desired_goal")
 
-    obs:
-      - "observation": [...],
-      - "desired_goal": [...],
-      - "achieved_goal": [...]
+
+def _resolve_obs_keys_from_dict(obs_dict: Dict[str, Any], obs_keys: Optional[Sequence[str]]) -> Tuple[str, ...]:
     """
-    o = np.asarray(obs["observation"], dtype=np.float32).ravel()
-    dg = np.asarray(obs["desired_goal"], dtype=np.float32).ravel()
-    ag = np.asarray(obs["achieved_goal"], dtype=np.float32).ravel()
-    return np.concatenate([o, dg, ag], axis=0)
+    - if obs_keys provided -> use them
+    - otherwise:
+      - if the dict has the standard 3 keys -> use _DEFAULT_PANDA_KEYS
+      - else use the dict insertion order
+    """
+    if obs_keys is not None:
+        return tuple(obs_keys)
+
+    if all(k in obs_dict for k in _DEFAULT_PANDA_KEYS):
+        return _DEFAULT_PANDA_KEYS
+
+    # fallback: zachowaj kolejność insertion-order
+    return tuple(obs_dict.keys())
+
+
+def flatten_panda_step(obs: Dict[str, np.ndarray], obs_keys: Optional[Sequence[str]] = None) -> np.ndarray:
+    """
+    Flatten single Panda obs dict into 1D vector using obs_keys order.
+
+    This is the equivalent of an "extractor" based on observation_space.
+    """
+    keys = _resolve_obs_keys_from_dict(obs, obs_keys)
+    parts: List[np.ndarray] = []
+    for k in keys:
+        if k not in obs:
+            raise KeyError(f"Missing key {k!r} in obs dict. Available keys: {list(obs.keys())}")
+        parts.append(np.asarray(obs[k], dtype=np.float32).ravel())
+    return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+
+
+def _slice_obs(obs_all: Any, start: int, end: int) -> Any:
+    """
+    Slice obs_all for 2 formats:
+      - dict-of-arrays: {key: np.ndarray[N,...]}
+      - array/list: np.ndarray[N,...] or list
+    """
+    if isinstance(obs_all, dict):
+        return {k: np.asarray(v[start:end]) for k, v in obs_all.items()}
+    return obs_all[start:end]
+
+
+def _parse_episode_ends(episode_ends: Any, N: int) -> np.ndarray:
+    """
+    Support different episode_ends formats:
+      - boolean mask of length N (True at episode ends)
+      - 0/1 mask of length N
+      - end indices: inclusive (max==N-1) or exclusive (max==N)
+    Returns increasing EXCLUSIVE indices (i.e. end = t+1).
+    """
+    ends_raw = np.asarray(episode_ends)
+
+    # bool mask -> indeksy
+    if ends_raw.dtype == np.bool_:
+        ends = np.nonzero(ends_raw)[0] + 1
+    else:
+        ends_raw = ends_raw.astype(np.int64).reshape(-1)
+
+        # 0/1 mask o długości N -> indeksy
+        if ends_raw.size == N and ends_raw.max(initial=0) <= 1:
+            ends = np.nonzero(ends_raw.astype(bool))[0] + 1
+        else:
+            ends = ends_raw
+
+        # inclusive -> exclusive
+        if ends.size > 0 and ends.max(initial=0) == (N - 1):
+            ends = ends + 1
+
+    ends = np.asarray(ends, dtype=np.int64)
+    ends = ends[(ends > 0) & (ends <= N)]
+
+    if ends.size == 0:
+        return np.array([N], dtype=np.int64)
+
+    ends = np.unique(ends)
+    ends.sort()
+
+    if ends[-1] != N:
+        ends = np.append(ends, N)
+
+    return ends
 
 
 def _make_trajectory(
@@ -26,26 +103,27 @@ def _make_trajectory(
     actions_seq: Any,
     rewards_seq: Any,
     gamma: float = 1.0,
+    obs_keys: Optional[Sequence[str]] = None,
 ) -> Trajectory:
     """
     Build Trajectory for Panda with continuous actions.
 
     obs_seq:
-      - dict of arrays: keys "observation", "desired_goal", "achieved_goal",
+      - dict of arrays: keys e.g. "observation", "desired_goal", "achieved_goal",
         each [T, dim], OR
-      - list of dicts / list of vectors [T, ...].
-    actions_seq:
-      - array [T, act_dim] (continuous)
-    rewards_seq:
-      - array/list [T]
+      - list of dicts / list of vectors [T, ...], OR
+      - array [T, obs_dim] already flattened.
     """
     # ---- OBS ----
-    if isinstance(obs_seq, dict) and "observation" in obs_seq:
-        # dict of arrays, shape [T, dim] each
-        obs_arr = np.asarray(obs_seq["observation"], dtype=np.float32)
-        dg_arr = np.asarray(obs_seq["desired_goal"], dtype=np.float32)
-        ag_arr = np.asarray(obs_seq["achieved_goal"], dtype=np.float32)
-        obs = np.concatenate([obs_arr, dg_arr, ag_arr], axis=-1).astype(np.float32)
+    if isinstance(obs_seq, dict):
+        keys = _resolve_obs_keys_from_dict(obs_seq, obs_keys)
+        for k in keys:
+            if k not in obs_seq:
+                raise KeyError(f"Missing key {k!r} in obs_seq dict. Available: {list(obs_seq.keys())}")
+
+        parts = [np.asarray(obs_seq[k], dtype=np.float32) for k in keys]
+        obs = np.concatenate(parts, axis=-1).astype(np.float32, copy=False)
+
     else:
         # list of dicts / vectors
         if (
@@ -53,19 +131,17 @@ def _make_trajectory(
             and len(obs_seq) > 0
             and isinstance(obs_seq[0], dict)
         ):
-            obs = np.stack([flatten_panda_step(o) for o in obs_seq], axis=0).astype(
-                np.float32
-            )
+            obs = np.stack([flatten_panda_step(o, obs_keys=obs_keys) for o in obs_seq], axis=0).astype(np.float32)
         else:
             obs = np.asarray(obs_seq, dtype=np.float32)
 
-    # ---- ACTIONS (ciągłe) ----
+    # ---- ACTIONS / REWARDS ----
     actions = np.asarray(actions_seq, dtype=np.float32)
     rewards = np.asarray(rewards_seq, dtype=np.float32).reshape(-1)
 
-    T = rewards.shape[0]
+    T = int(rewards.shape[0])
 
-    # dopasowanie długości
+    # adjust lengths (sometimes the dataset has obs length T+1)
     if obs.shape[0] == T + 1:
         obs = obs[:-1]
     if actions.shape[0] == T + 1:
@@ -73,12 +149,11 @@ def _make_trajectory(
 
     if obs.shape[0] != T or actions.shape[0] != T:
         raise ValueError(
-            f"Length mismatch in Panda trajectory: "
-            f"obs={obs.shape[0]}, actions={actions.shape[0]}, rewards={T}"
+            f"Length mismatch in Panda trajectory: obs={obs.shape[0]}, actions={actions.shape[0]}, rewards={T}"
         )
 
     timesteps = np.arange(T, dtype=np.int64)
-    returns_to_go = discount_cumsum(rewards, gamma=gamma)
+    returns_to_go = discount_cumsum(rewards, gamma=float(gamma))
 
     return Trajectory(
         obs=obs,
@@ -89,9 +164,17 @@ def _make_trajectory(
     )
 
 
-def load_panda_offline_pkl(path: str, gamma: float = 1.0) -> List[Trajectory]:
+def load_panda_offline_pkl(
+    path: str,
+    gamma: float = 1.0,
+    obs_keys: Optional[Sequence[str]] = None,
+) -> List[Trajectory]:
     """
     Load panda-gym(-offline) dataset and convert to list[Trajectory].
+
+    Notes:
+      - obs_keys allows matching flatten order to env.observation_space (extractor-style)
+      - episode_ends can be a mask or a list of indices (we support both)
     """
     with open(path, "rb") as f:
         data = pickle.load(f)
@@ -104,117 +187,125 @@ def load_panda_offline_pkl(path: str, gamma: float = 1.0) -> List[Trajectory]:
             obs_seq = ep["observations"]
             actions_seq = ep["actions"]
             rewards_seq = ep["rewards"]
-            trajs.append(
-                _make_trajectory(obs_seq, actions_seq, rewards_seq, gamma=gamma)
-            )
+            trajs.append(_make_trajectory(obs_seq, actions_seq, rewards_seq, gamma=float(gamma), obs_keys=obs_keys))
         return trajs
 
     # Case 2: dict of arrays
     if isinstance(data, dict) and "observations" in data:
         obs_all = data["observations"]
-        actions_all = data["actions"]
-        rewards_all = data["rewards"]
+        actions_all = np.asarray(data["actions"], dtype=np.float32)
+        rewards_all = np.asarray(data["rewards"], dtype=np.float32).reshape(-1)
 
-        # ep boundaries
+        N = int(len(rewards_all))
+
+        # episode boundaries
         if "episode_ends" in data:
-            ends = np.asarray(data["episode_ends"], dtype=np.int64)
+            ends = _parse_episode_ends(data["episode_ends"], N)
             start = 0
             for end in ends:
+                end = int(end)
+                if end <= start:
+                    continue
+                obs_seq = _slice_obs(obs_all, start, end)
                 trajs.append(
                     _make_trajectory(
-                        obs_all[start:end],
+                        obs_seq,
                         actions_all[start:end],
                         rewards_all[start:end],
-                        gamma=gamma,
+                        gamma=float(gamma),
+                        obs_keys=obs_keys,
                     )
                 )
                 start = end
+            return trajs
+
+        # fallback: dones/terminals
+        if "dones" in data:
+            dones = np.asarray(data["dones"], dtype=bool).reshape(-1)
+        elif "terminals" in data:
+            dones = np.asarray(data["terminals"], dtype=bool).reshape(-1)
         else:
-            if "dones" in data:
-                dones = np.asarray(data["dones"], dtype=bool)
-            elif "terminals" in data:
-                dones = np.asarray(data["terminals"], dtype=bool)
-            else:
-                raise ValueError(
-                    "Cannot find episode boundaries in panda dataset "
-                    "(no 'episode_ends', 'dones' or 'terminals')."
-                )
-            N = len(rewards_all)
-            start = 0
-            for t in range(N):
-                if dones[t] or t == N - 1:
-                    end = t + 1
-                    trajs.append(
-                        _make_trajectory(
-                            obs_all[start:end],
-                            actions_all[start:end],
-                            rewards_all[start:end],
-                            gamma=gamma,
-                        )
-                    )
+            raise ValueError("Cannot find episode boundaries (no 'episode_ends', 'dones' or 'terminals').")
+
+        start = 0
+        for t in range(N):
+            if dones[t] or t == N - 1:
+                end = t + 1
+                if end <= start:
                     start = end
+                    continue
+                obs_seq = _slice_obs(obs_all, start, end)
+                trajs.append(
+                    _make_trajectory(
+                        obs_seq,
+                        actions_all[start:end],
+                        rewards_all[start:end],
+                        gamma=float(gamma),
+                        obs_keys=obs_keys,
+                    )
+                )
+                start = end
         return trajs
 
     raise ValueError(f"Unsupported panda dataset format in {path}: type {type(data)}")
 
 
+# -----------------------------------------------------------------------------
+# Minibatch sampler
+# -----------------------------------------------------------------------------
 def make_minibatches_panda(
     trajs: List[Trajectory],
+    *,
     seq_len: int,
     batch_size: int,
     device: str,
-):
-    """
-    Minibatch generator dla Pandy z ciągłymi akcjami.
-    Zwraca:
-      obs:    [B, L, obs_dim]
-      actions:[B, L, act_dim]
-      rtg:    [B, L, 1]
-      ts:     [B, L]
-      mask:   [B, L]  (1 dla prawdziwych kroków, 0 dla paddingu)
-    """
-    import numpy as _np
-    import torch
+    act_dim: int,
+    obs_dim: int,
+) -> Iterator:
+    seq_len = int(seq_len)
+    batch_size = int(batch_size)
+    dev = torch.device(device)
+
+    n_windows = np.array([max(1, len(t.actions) - seq_len + 1) for t in trajs], dtype=np.int64)
+    cdf = np.cumsum(n_windows / n_windows.sum())
 
     while True:
-        B_obs, B_actions, B_rtg, B_ts, B_mask = [], [], [], [], []
+        u = np.random.rand(batch_size)
+        idxs = np.searchsorted(cdf, u, side="right")
 
-        for _ in range(batch_size):
-            tr = _np.random.choice(trajs)
-            T = tr.actions.shape[0]
-            start = 0 if T <= seq_len else _np.random.randint(0, T - seq_len + 1)
-            end = min(start + seq_len, T)
+        obs_b = np.zeros((batch_size, seq_len, obs_dim), dtype=np.float32)
+        act_b = np.zeros((batch_size, seq_len, act_dim), dtype=np.float32)
+        rtg_b = np.zeros((batch_size, seq_len, 1), dtype=np.float32)
+        ts_b  = np.zeros((batch_size, seq_len), dtype=np.int64)
+        mask_b = np.zeros((batch_size, seq_len), dtype=np.bool_)
 
-            o = tr.obs[start:end]          # [L, obs_dim]
-            a = tr.actions[start:end]      # [L, act_dim]
-            rtg = tr.returns_to_go[start:end]
-            ts = tr.timesteps[start:end]
+        for b, idx in enumerate(idxs):
+            tr = trajs[int(idx)]
+            L = int(len(tr.actions))
 
-            L = a.shape[0]
-            pad = seq_len - L
-
-            mask = _np.zeros(seq_len, dtype=_np.float32)
-
-            if pad > 0:
-                # pad at END
-                o = _np.pad(o, ((0, pad), (0, 0)), mode="constant")
-                a = _np.pad(a, ((0, pad), (0, 0)), mode="constant")
-                rtg = _np.pad(rtg, (0, pad), mode="constant")
-                ts = _np.pad(ts, (0, pad), mode="constant")
-                mask[:L] = 1.0
+            if L <= seq_len:
+                si = 0
             else:
-                mask[:] = 1.0
+                si = np.random.randint(0, L - seq_len + 1)
 
-            B_obs.append(o)
-            B_actions.append(a)
-            B_rtg.append(rtg[:, None])
-            B_ts.append(ts)
-            B_mask.append(mask)
+            end = min(si + seq_len, L)
+            tlen = end - si
+            pad = seq_len - tlen
 
-        obs = torch.tensor(_np.stack(B_obs), dtype=torch.float32, device=device)
-        actions = torch.tensor(_np.stack(B_actions), dtype=torch.float32, device=device)
-        rtg = torch.tensor(_np.stack(B_rtg), dtype=torch.float32, device=device)
-        ts = torch.tensor(_np.stack(B_ts), dtype=torch.long, device=device)
-        mask = torch.tensor(_np.stack(B_mask), dtype=torch.float32, device=device)
+            obs = np.asarray(tr.obs, dtype=np.float32).reshape(-1, obs_dim)[si:end]
+            act = np.asarray(tr.actions, dtype=np.float32).reshape(-1, act_dim)[si:end]
+            rtg = np.asarray(tr.returns_to_go, dtype=np.float32).reshape(-1)[si:end]
 
-        yield obs, actions, rtg, ts, mask
+            obs_b[b, pad:, :] = obs
+            act_b[b, pad:, :] = act
+            rtg_b[b, pad:, 0] = rtg
+            ts_b[b, pad:] = np.arange(si, si + tlen, dtype=np.int64)
+            mask_b[b, pad:] = True
+
+        yield (
+            torch.from_numpy(obs_b).to(dev),
+            torch.from_numpy(act_b).to(dev),
+            torch.from_numpy(rtg_b).to(dev),
+            torch.from_numpy(ts_b).to(dev),
+            torch.from_numpy(mask_b).to(dev),
+        )

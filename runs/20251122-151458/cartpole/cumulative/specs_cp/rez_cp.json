@@ -1,8 +1,0 @@
-{
-  "metrics": {
-    "ACC": 43.11428451538086,
-    "BWT": 28.399999618530273,
-    "Forgetting": 0.0
-  },
-  "strategy": "cumulative"
-}

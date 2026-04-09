@@ -1,0 +1,5 @@
+[
+  { "name": "A_Pong",     "seed": 0, "params": { "game": "ALE/Pong-v5",     "frame_stack": 4, "clip_rewards": true } },
+  { "name": "B_Breakout", "seed": 1, "params": { "game": "ALE/Breakout-v5", "frame_stack": 4, "clip_rewards": true } },
+  { "name": "C_Seaquest", "seed": 2, "params": { "game": "ALE/Seaquest-v5", "frame_stack": 4, "clip_rewards": true } }
+]

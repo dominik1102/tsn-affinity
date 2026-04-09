@@ -1,70 +1,30 @@
 from __future__ import annotations
-from .base import BaseStrategy
-from dt.dataset import Trajectory, make_minibatches
 
+from typing import List, Optional
 
-
-from typing import List
-
+import numpy as np
 import torch
-import torch.nn.functional as F
 
-from dt.dataset_panda import make_minibatches_panda
+from dt.dataset import Trajectory
 from dt.panda_dt import PandaDecisionTransformer
+from .base import BaseStrategy
+from .utils import make_panda_loader, masked_mse, unpack_batch_continuous
+
 
 class NaiveStrategy(BaseStrategy):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    """
+    Atari / discrete naive strategy.
 
-    def train_task(
-        self,
-        task_trajs: List[Trajectory],
-        steps: int = 2000,
-        batch_size: int = 64,
-    ):
-        # minibatches only from the current task (no rehearsal buffer)
-        loader_task = make_minibatches(
-            task_trajs,
-            self.seq_len,
-            batch_size,
-            self.device,
-        )
-
-        self.model.train()
-        for _ in range(steps):
-            obs, actions, rtg, ts = next(loader_task)
-
-            # shift actions by 1 along the sequence (same as in cumulative replay)
-            logits = self.model(
-                obs,
-                torch.roll(actions, shifts=1, dims=1),
-                rtg,
-                ts,
-            )
-
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                actions.reshape(-1),
-                ignore_index=-1,
-            )
-
-            self.opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.opt.step()
-
-        return {}
-
-    def after_task(self, task_trajs: List[Trajectory]):
-        # Naive strategy: do nothing after finishing a task
-        # (no rehearsal buffer, no weight consolidation)
-        pass
-
+    BaseStrategy already implements the correct aligned-action DT training loop,
+    so this class only exists to keep the import path stable.
+    """
+    pass
 
 
 class PandaNaiveStrategy:
     """
-    Naive continual strategy for Panda with continuous actions.
+    Continuous-action naive strategy for Panda.
+    Loss: masked MSE on continuous actions.
     """
 
     def __init__(
@@ -73,63 +33,84 @@ class PandaNaiveStrategy:
         act_dim: int,
         seq_len: int,
         device: str,
+        *,
         d_model: int = 128,
         n_layers: int = 3,
-        n_heads: int = 4,
+        n_heads: int = 1,
         p_drop: float = 0.1,
-        lr: float = 3e-4,
+        lr: float = 1e-4,
         weight_decay: float = 1e-4,
+        grad_clip: float = 0.25,
+        max_ep_len: int = 50,
+        rtg_scale: float = 1000.0,
+        obs_mean: Optional[np.ndarray] = None,
+        obs_std: Optional[np.ndarray] = None,
     ):
-        self.seq_len = seq_len
-        self.device = device
+        self.seq_len = int(seq_len)
+        self.device = torch.device(str(device))
+        self.grad_clip = float(grad_clip)
 
-        obs_dim = obs_shape[0]
+        self.obs_dim = int(obs_shape[0])
+        self.act_dim = int(act_dim)
+
+        self.model_hparams = {
+            "obs_dim": self.obs_dim,
+            "act_dim": self.act_dim,
+            "seq_len": int(seq_len),
+            "d_model": int(d_model),
+            "n_layers": int(n_layers),
+            "n_heads": int(n_heads),
+            "p_drop": float(p_drop),
+            "max_ep_len": int(max_ep_len),
+            "rtg_scale": float(rtg_scale),
+            "lr": float(lr),
+            "weight_decay": float(weight_decay),
+            "grad_clip": float(grad_clip),
+        }
+
         self.model = PandaDecisionTransformer(
-            obs_dim=obs_dim,
-            act_dim=act_dim,
-            d_model=d_model,
-            n_layers=n_layers,
-            n_heads=n_heads,
-            seq_len=seq_len,
-            p_drop=p_drop,
-        ).to(device)
+            obs_dim=self.obs_dim,
+            act_dim=self.act_dim,
+            d_model=int(d_model),
+            n_layers=int(n_layers),
+            n_heads=int(n_heads),
+            seq_len=self.seq_len,
+            p_drop=float(p_drop),
+            max_ep_len=int(max_ep_len),
+            act_tanh=False,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
+            rtg_scale=float(rtg_scale),
+        ).to(self.device)
 
         self.opt = torch.optim.AdamW(
             self.model.parameters(),
-            lr=lr,
-            weight_decay=weight_decay,
+            lr=float(lr),
+            weight_decay=float(weight_decay),
         )
 
-    def train_task(
-        self,
-        task_trajs: List[Trajectory],
-        steps: int = 2000,
-        batch_size: int = 64,
-    ):
-        loader = make_minibatches_panda(
-            task_trajs, self.seq_len, batch_size, self.device
+    def train_task(self, task_trajs: List[Trajectory], steps: int = 2000, batch_size: int = 64):
+        loader = make_panda_loader(
+            task_trajs,
+            seq_len=self.seq_len,
+            batch_size=int(batch_size),
+            device=self.device,
+            obs_dim=self.obs_dim,
+            act_dim=self.act_dim,
         )
 
         self.model.train()
-        for _ in range(steps):
-            obs, actions, rtg, ts, mask = next(loader)
-            # previous actions = shifted actions; first prev action = 0
-            prev_actions = torch.roll(actions, shifts=1, dims=1)
-            prev_actions[:, 0, :] = 0.0
-
-            pred = self.model(obs, prev_actions, rtg, ts)  # [B, L, act_dim]
-
-            # MSE z maską (ignorujemy padding)
-            mse_per_step = ((pred - actions) ** 2).mean(dim=-1)  # [B, L]
-            loss = (mse_per_step * mask).sum() / mask.sum()
+        for _ in range(int(steps)):
+            obs, actions, rtg, ts, mask = unpack_batch_continuous(next(loader))
+            pred = self.model(obs, actions, rtg, ts, attention_mask=mask)
+            loss = masked_mse(pred, actions, mask)
 
             self.opt.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
             self.opt.step()
 
         return {}
 
     def after_task(self, task_trajs: List[Trajectory]):
-        # Naive: nic po tasku
         return
