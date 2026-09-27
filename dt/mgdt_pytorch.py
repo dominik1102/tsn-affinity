@@ -433,34 +433,90 @@ class MultiGameDecisionTransformer(nn.Module):
 
 
 @torch.no_grad()
+def _mask_to_top_percentile_logits(
+    logits: torch.Tensor,
+    top_percentile: Optional[float] = None,
+) -> torch.Tensor:
+    """Keep only logits at or above the given percentile threshold.
+
+    This matches the paper/code phrasing of sampling from the "top 85th percentile logits":
+    compute the logit percentile per row and mask everything below it.
+
+    Args:
+        logits: [B, V] or [V]
+        top_percentile: percentile in [0,100]. None disables masking.
+    """
+    if top_percentile is None:
+        return logits
+    p = float(top_percentile)
+    if p <= 0.0:
+        return logits
+    if p > 100.0:
+        raise ValueError(f"top_percentile must be in [0,100], got {top_percentile}")
+
+    squeeze = False
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+        squeeze = True
+    elif logits.dim() != 2:
+        raise ValueError(f"Expected logits [B,V] or [V], got {tuple(logits.shape)}")
+
+    filtered = logits.clone()
+    work = filtered.to(torch.float32)
+    sentinel = -1e8
+
+    for b in range(work.shape[0]):
+        row = work[b]
+        # Ignore already-masked invalid logits (e.g. invalid env actions set to -1e9)
+        valid = row > sentinel
+        vals = row[valid]
+        if vals.numel() == 0:
+            continue
+        thresh = torch.quantile(vals, q=p / 100.0)
+        drop = valid & (row < thresh)
+        filtered[b, drop] = -1e9
+
+    return filtered.squeeze(0) if squeeze else filtered
+
+
+@torch.no_grad()
 def sample_expert_return(
     return_logits: torch.Tensor,
     return_range: Tuple[int, int],
     kappa: float = 10.0,
     temperature: float = 1.0,
+    top_percentile: Optional[float] = None,
 ) -> torch.Tensor:
     """Sample a high-but-plausible return token as in MGDT expert-action inference.
 
-    Args:
-        return_logits: [B, num_returns]
-    Returns:
-        sampled return token IDs [B]
+    If top_percentile is provided, logits are first filtered to values at or above
+    that percentile threshold, matching the published MGDT evaluation recipe.
     """
     low, high = return_range
     values = torch.arange(low, high, device=return_logits.device, dtype=torch.float32)
-    logp = F.log_softmax(return_logits / max(temperature, 1e-6), dim=-1)
-    expert_bonus = kappa * (values - float(low)) / max(1.0, float(high - low))
-    guided = logp + expert_bonus.view(1, -1)
+    scaled = return_logits / max(temperature, 1e-6)
+    guided = scaled + kappa * (values - float(low)) / max(1.0, float(high - low))
+    guided = _mask_to_top_percentile_logits(guided, top_percentile=top_percentile)
     probs = F.softmax(guided, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 @torch.no_grad()
-def sample_action_from_logits(action_logits: torch.Tensor, greedy: bool = False) -> torch.Tensor:
-    """Sample or greedily decode the action token."""
+def sample_action_from_logits(
+    action_logits: torch.Tensor,
+    greedy: bool = False,
+    temperature: float = 1.0,
+    top_percentile: Optional[float] = None,
+) -> torch.Tensor:
+    """Sample or greedily decode the action token.
+
+    For paper-like evaluation, set greedy=False, temperature=1, top_percentile=85.
+    """
     if greedy:
         return action_logits.argmax(dim=-1)
-    probs = F.softmax(action_logits, dim=-1)
+    scaled = action_logits / max(temperature, 1e-6)
+    scaled = _mask_to_top_percentile_logits(scaled, top_percentile=top_percentile)
+    probs = F.softmax(scaled, dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 

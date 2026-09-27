@@ -101,6 +101,12 @@ class _TSNMaskMixin:
         self.occupied_weight_mask = None
         self.occupied_bias_mask = None
 
+    def clear_residual_base_masks(self) -> None:
+        """Clear source-task base masks used by residual reuse training."""
+        self.residual_base_weight_mask = None
+        self.residual_base_bias_mask = None
+        self.residual_keep_ratio = None
+
     def _get_free_weight_mask(self) -> Optional[torch.Tensor]:
         if self.allow_weight_reuse or self.occupied_weight_mask is None:
             return None
@@ -117,7 +123,22 @@ class _TSNMaskMixin:
         if self.active_weight_mask is not None:
             mask = self.active_weight_mask.to(device=self.weight.device, dtype=self.weight.dtype)
         else:
-            mask = _TopKMaskSTE.apply(self.score.abs(), float(self.keep_ratio), self._get_free_weight_mask())
+            base_mask = getattr(self, "residual_base_weight_mask", None)
+            if base_mask is None:
+                mask = _TopKMaskSTE.apply(self.score.abs(), float(self.keep_ratio), self._get_free_weight_mask())
+            else:
+                # Residual reuse: source-task frozen base mask plus a small delta mask.
+                base = base_mask.to(device=self.weight.device, dtype=torch.bool)
+                free = self._get_free_weight_mask()
+                if free is None:
+                    free = ~base
+                else:
+                    free = torch.logical_and(free.to(device=self.weight.device, dtype=torch.bool), ~base)
+                residual_keep = getattr(self, "residual_keep_ratio", None)
+                if residual_keep is None:
+                    residual_keep = self.keep_ratio
+                delta = _TopKMaskSTE.apply(self.score.abs(), float(residual_keep), free).to(dtype=torch.bool)
+                mask = torch.logical_or(base, delta).to(dtype=self.weight.dtype)
         self.weight_mask = mask.detach().to(dtype=torch.uint8)
         return mask
 
@@ -128,7 +149,21 @@ class _TSNMaskMixin:
         if self.active_bias_mask is not None:
             mask = self.active_bias_mask.to(device=self.bias.device, dtype=self.bias.dtype)
         else:
-            mask = _TopKMaskSTE.apply(self.bias_score.abs(), float(self.keep_ratio), self._get_free_bias_mask())
+            base_mask = getattr(self, "residual_base_bias_mask", None)
+            if base_mask is None:
+                mask = _TopKMaskSTE.apply(self.bias_score.abs(), float(self.keep_ratio), self._get_free_bias_mask())
+            else:
+                base = base_mask.to(device=self.bias.device, dtype=torch.bool)
+                free = self._get_free_bias_mask()
+                if free is None:
+                    free = ~base
+                else:
+                    free = torch.logical_and(free.to(device=self.bias.device, dtype=torch.bool), ~base)
+                residual_keep = getattr(self, "residual_keep_ratio", None)
+                if residual_keep is None:
+                    residual_keep = self.keep_ratio
+                delta = _TopKMaskSTE.apply(self.bias_score.abs(), float(residual_keep), free).to(dtype=torch.bool)
+                mask = torch.logical_or(base, delta).to(dtype=self.bias.dtype)
         self.bias_mask = mask.detach().to(dtype=torch.uint8)
         return mask
 
@@ -159,6 +194,9 @@ class TSNLinear(nn.Linear, _TSNMaskMixin):
         self.active_bias_mask = None
         self.occupied_weight_mask = None
         self.occupied_bias_mask = None
+        self.residual_base_weight_mask = None
+        self.residual_base_bias_mask = None
+        self.residual_keep_ratio = None
 
         self.reset_scores()
 
@@ -198,6 +236,9 @@ class TSNConv2d(nn.Conv2d, _TSNMaskMixin):
         self.active_bias_mask = None
         self.occupied_weight_mask = None
         self.occupied_bias_mask = None
+        self.residual_base_weight_mask = None
+        self.residual_base_bias_mask = None
+        self.residual_keep_ratio = None
 
         self.reset_scores()
 
@@ -242,6 +283,9 @@ class TSNEmbedding(nn.Embedding, _TSNMaskMixin):
         self.active_bias_mask = None
         self.occupied_weight_mask = None
         self.occupied_bias_mask = None
+        self.residual_base_weight_mask = None
+        self.residual_base_bias_mask = None
+        self.residual_keep_ratio = None
 
         self.reset_scores()
 

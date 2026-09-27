@@ -32,6 +32,17 @@ MINARI_ATARI_KWARGS_BASE: Dict[str, Any] = {
     "max_num_frames_per_episode": 108000,
 }
 
+def _ensure_ale_registered_local() -> None:
+    try:
+        import ale_py  # type: ignore
+        import gymnasium as gym
+        gym.register_envs(ale_py)
+    except Exception as e:
+        raise RuntimeError(
+            "ALE environments are not available. Install 'ale-py' or 'gymnasium[atari]' "
+            "and ensure ALE is registered."
+        ) from e
+
 
 # ============================================================
 # DQN preprocess identyczny jak w Twoim eksporcie:
@@ -134,14 +145,25 @@ def make_minari_atari_env(
     Env compatible with Minari expert-v0:
       - base ALE/<Game>-v5 with frameskip=4, repeat_action_probability=0, obs_type=rgb
       - wrapper only does preprocess + stack (no additional frame_skip)
+
+    IMPORTANT:
+      - DO NOT resolve ids through gym.registry here.
+      - The old direct gym.make(env_id, **kwargs) path already worked in previous DT/MGDT runs.
+      - Only ensure ALE registration locally before calling gym.make.
     """
+    _ensure_ale_registered_local()
+
     kwargs = dict(MINARI_ATARI_KWARGS_BASE)
     kwargs["game"] = _game_slug(env_id)
 
     env = gym.make(env_id, **kwargs)
-    env = MinariDQNStackWrapper(env, frame_stack=frame_stack, dqn_size=dqn_size, clip_rewards=clip_rewards)
+    env = MinariDQNStackWrapper(
+        env,
+        frame_stack=frame_stack,
+        dqn_size=dqn_size,
+        clip_rewards=clip_rewards,
+    )
 
-    # seed reset (opcjonalnie)
     if seed is not None:
         env.reset(seed=int(seed))
 

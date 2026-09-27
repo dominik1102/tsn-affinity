@@ -398,6 +398,8 @@ class TSNPandaStrategy:
         task_id = int(self.current_task_id)
 
         task_masks = self._collect_current_task_masks()
+
+
         self.per_task_masks[task_id] = task_masks
         self.task_codebooks[task_id] = self._quantize_new_weights_for_current_task(task_masks)
         self._update_consolidated_masks(task_masks)
