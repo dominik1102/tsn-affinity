@@ -1,0 +1,38 @@
+{
+  "name": "A_Alien",
+  "dataset_id": "atari/alien/expert-v0",
+  "seed": 0,
+  "preprocess": "dqn",
+  "obs_dtype": "float32",
+  "dqn_size": 84,
+  "frame_stack": 4,
+  "clip_rewards": true,
+  "n_episodes": 10,
+  "max_len": 50000,
+  "total_steps_written": 8349,
+  "episode_lengths": [
+    1184,
+    696,
+    1035,
+    679,
+    1032,
+    907,
+    1070,
+    583,
+    569,
+    594
+  ],
+  "episode_returns": [
+    79.0,
+    55.0,
+    86.0,
+    53.0,
+    60.0,
+    62.0,
+    73.0,
+    46.0,
+    40.0,
+    52.0
+  ],
+  "hit_max_len_without_done": 0
+}

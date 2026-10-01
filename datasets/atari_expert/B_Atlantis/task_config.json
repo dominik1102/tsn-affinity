@@ -1,0 +1,17 @@
+{
+  "name": "B_Atlantis",
+  "env_id": null,
+  "seed": 1,
+  "params": {
+    "game": "ALE/Atlantis-v5",
+    "frameskip": 4,
+    "noop_max": 30,
+    "sticky_actions": true,
+    "repeat_action_prob": 0.25,
+    "terminal_on_life_loss": true,
+    "clip_rewards": true,
+    "grayscale_obs": true,
+    "scale_obs": false,
+    "frame_stack": 4
+  }
+}

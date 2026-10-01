@@ -1,0 +1,52 @@
+[
+  {
+    "name": "A_Alien",
+    "minari_dataset_id": "atari/alien/expert-v0",
+    "npz_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/A_Alien/expert_minari_dqn.npz",
+    "stats_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/A_Alien/expert_minari_dqn_stats.json",
+    "total_steps": 8349,
+    "n_episodes": 10,
+    "obs_dtype": "float32",
+    "preprocess": "dqn"
+  },
+  {
+    "name": "B_Atlantis",
+    "minari_dataset_id": "atari/atlantis/expert-v0",
+    "npz_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/B_Atlantis/expert_minari_dqn.npz",
+    "stats_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/B_Atlantis/expert_minari_dqn_stats.json",
+    "total_steps": 270000,
+    "n_episodes": 10,
+    "obs_dtype": "float32",
+    "preprocess": "dqn"
+  },
+  {
+    "name": "C_Boxing",
+    "minari_dataset_id": "atari/boxing/expert-v0",
+    "npz_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/C_Boxing/expert_minari_dqn.npz",
+    "stats_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/C_Boxing/expert_minari_dqn_stats.json",
+    "total_steps": 4831,
+    "n_episodes": 10,
+    "obs_dtype": "float32",
+    "preprocess": "dqn"
+  },
+  {
+    "name": "D_Breakout",
+    "minari_dataset_id": "atari/breakout/expert-v0",
+    "npz_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/D_Breakout/expert_minari_dqn.npz",
+    "stats_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/D_Breakout/expert_minari_dqn_stats.json",
+    "total_steps": 23075,
+    "n_episodes": 10,
+    "obs_dtype": "float32",
+    "preprocess": "dqn"
+  },
+  {
+    "name": "E_Centipede",
+    "minari_dataset_id": "atari/centipede/expert-v0",
+    "npz_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/E_Centipede/expert_minari_dqn.npz",
+    "stats_path": "/net/tscratch/people/plgdomin088/datasets/atari_expert/E_Centipede/expert_minari_dqn_stats.json",
+    "total_steps": 6864,
+    "n_episodes": 10,
+    "obs_dtype": "float32",
+    "preprocess": "dqn"
+  }
+]

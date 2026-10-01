@@ -1,0 +1,38 @@
+{
+  "name": "E_Centipede",
+  "dataset_id": "atari/centipede/expert-v0",
+  "seed": 4,
+  "preprocess": "dqn",
+  "obs_dtype": "float32",
+  "dqn_size": 84,
+  "frame_stack": 4,
+  "clip_rewards": true,
+  "n_episodes": 10,
+  "max_len": 50000,
+  "total_steps_written": 6864,
+  "episode_lengths": [
+    752,
+    782,
+    561,
+    702,
+    691,
+    534,
+    713,
+    805,
+    671,
+    653
+  ],
+  "episode_returns": [
+    117.0,
+    131.0,
+    95.0,
+    118.0,
+    135.0,
+    103.0,
+    125.0,
+    130.0,
+    90.0,
+    115.0
+  ],
+  "hit_max_len_without_done": 0
+}

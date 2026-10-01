@@ -1,0 +1,38 @@
+{
+  "name": "D_Breakout",
+  "dataset_id": "atari/breakout/expert-v0",
+  "seed": 3,
+  "preprocess": "dqn",
+  "obs_dtype": "float32",
+  "dqn_size": 84,
+  "frame_stack": 4,
+  "clip_rewards": true,
+  "n_episodes": 10,
+  "max_len": 50000,
+  "total_steps_written": 23075,
+  "episode_lengths": [
+    2363,
+    2956,
+    1663,
+    3578,
+    1905,
+    2581,
+    2650,
+    1242,
+    1883,
+    2254
+  ],
+  "episode_returns": [
+    97.0,
+    114.0,
+    54.0,
+    112.0,
+    103.0,
+    105.0,
+    107.0,
+    35.0,
+    90.0,
+    98.0
+  ],
+  "hit_max_len_without_done": 0
+}
