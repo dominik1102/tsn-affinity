@@ -1,37 +1,33 @@
-#!/usr/bin/env python3
+"""Helpers shared by the Panda Decision Transformer runner scripts."""
 from __future__ import annotations
 
 import argparse
 import csv
 import os
-from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import gymnasium as gym
-import panda_gym  # noqa: F401
 import numpy as np
 import torch
 
-from bin.helper import _set_seed
-from dt.utils import evaluate_dt_panda_cl
-from paths import RUNS
 from bin.config import PANDA_TASKS
 from clbench.benchmark.metrics import StandardCLMetrics
 from clbench.benchmark.metrics_extra import per_step_report
 from clbench.benchmark.runner import BenchmarkResults
-from clbench.io.run_logger import build_run_dir, save_json, save_matrix_csv, bench_short
-
+from clbench.io.run_logger import bench_short, save_json, save_matrix_csv
 from dt.dataset import Trajectory
 from dt.dataset_panda import load_panda_offline_pkl
+from dt.utils import evaluate_dt_panda_cl
+from paths import RUNS
+from strategies.cumulative import PandaCumulativeReplayStrategy
 from strategies.ewc import PandaEWCStrategy
 from strategies.naive import PandaNaiveStrategy
-from strategies.cumulative import PandaCumulativeReplayStrategy
 from strategies.si import PandaSIStrategy
 from strategies.tsn_improved_reuse_panda import TSNImprovedReusePandaStrategy
-from strategies.tsn_strategy_panda_dt_v1 import TSNPandaStrategy
 from strategies.tsn_original_reuse_panda import TSNOriginalReusePandaStrategy
+from strategies.tsn_strategy_panda_dt_v1 import TSNPandaStrategy
 
 PANDA_OBS_KEYS = ("observation", "achieved_goal", "desired_goal")
 
@@ -274,6 +270,13 @@ def make_env(env_id: str, *, add_time_feature: bool) -> gym.Env:
     return env
 
 
+def _resolve_device(requested: str) -> str:
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+    return "cuda" if (requested == "cuda" and torch.cuda.is_available()) else "cpu"
+
+
 # ------------------------------------------------------------
 # Trajectories
 # ------------------------------------------------------------
@@ -404,7 +407,8 @@ def _load_task(name: str) -> PandaTask:
     )
 
 
-def load_tasks(args) -> List[PandaTask]:
+def load_padded_tasks() -> List[PandaTask]:
+    """Load all TASK_ORDER tasks and pad their trajectories to the global obs/act dims."""
     print("\n=== Loading Panda tasks ===")
     tasks = [_load_task(name) for name in TASK_ORDER]
 
@@ -422,24 +426,22 @@ def load_tasks(args) -> List[PandaTask]:
 
     for t in tasks:
         t.trajs = [pad_trajectory(tr, obs_dim_global, act_dim_global) for tr in t.trajs]
-
-    for t in tasks:
-        if args.target_return is not None:
-            target, src = float(args.target_return), "global --target-return"
-        else:
-            target, src = float(HARD_TARGET_RETURNS[t.name]), "hardcoded"
-        t.target_return = target
-        t.record["target_return"] = target
-        t.record["target_return_source"] = src
-        print(f"[target] {t.name}: target_return={target:.6f} ({src})")
-
     return tasks
 
 
 # ------------------------------------------------------------
 # Strategy
 # ------------------------------------------------------------
-def build_strategy(args, obs_dim: int, act_dim: int, device: str, n_tasks: int):
+def build_strategy(
+    args,
+    obs_dim: int,
+    act_dim: int,
+    device: str,
+    n_tasks: int,
+    *,
+    improved_reuse_extra: Optional[Dict[str, Any]] = None,
+):
+    """`improved_reuse_extra` holds additional kwargs passed only to TSNImprovedReusePandaStrategy."""
     obs_shape = (obs_dim,)
     s = args.strategy
 
@@ -533,6 +535,7 @@ def build_strategy(args, obs_dim: int, act_dim: int, device: str, n_tasks: int):
         warmstart_strength=float(args.tsn_warmstart_strength),
         warmstart_noise_std=float(args.tsn_warmstart_noise_std),
         warmstart_on_new_copy=bool(args.tsn_warmstart_on_new_copy),
+        **(improved_reuse_extra or {}),
     )
 
 
@@ -685,13 +688,20 @@ def save_results(
     model_sig: str,
     obs_dim: int,
     act_dim: int,
+    *,
+    include_target_sources: bool = False,
+    hparams: Optional[Dict[str, Any]] = None,
 ) -> None:
+    """
+    `include_target_sources` adds `target_return_source_map` right after `target_return_map`;
+    `hparams` replaces the default `_strategy_hparams` block of results.json.
+    """
     task_names = [t.name for t in tasks]
     results = BenchmarkResults(name=f"DT-{args.strategy}:{SPEC_TAG}", task_names=task_names, perf_matrix=P)
     metrics = StandardCLMetrics.compute(results)
     is_tsn_reuse = args.strategy in TSN_REUSE_STRATEGIES
 
-    save_payload = {
+    save_payload: Dict[str, Any] = {
         "name": results.name,
         "task_names": task_names,
         "perf_matrix": P.tolist(),
@@ -702,6 +712,10 @@ def save_results(
         "obs_dim_global": obs_dim,
         "act_dim_global": act_dim,
         "target_return_map": {t.name: t.target_return for t in tasks},
+    }
+    if include_target_sources:
+        save_payload["target_return_source_map"] = {t.name: t.record["target_return_source"] for t in tasks}
+    save_payload.update({
         "seed": args.seed,
         "strategy": args.strategy,
         "seq_len": args.seq_len,
@@ -722,8 +736,8 @@ def save_results(
         "grad_clip": args.grad_clip,
         "max_ep_len": args.max_ep_len,
         "rtg_scale": args.rtg_scale,
-        **_strategy_hparams(strategy, args),
-    }
+        **(hparams if hparams is not None else _strategy_hparams(strategy, args)),
+    })
     if args.strategy == "tsn_origin_reuse":
         save_payload.update(_collect_origin_reuse_meta(strategy))
 
@@ -750,7 +764,13 @@ def save_results(
 # ------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------
-def build_arg_parser() -> argparse.ArgumentParser:
+def build_arg_parser(
+    *,
+    target_modes: Sequence[str],
+    target_mode_default: str,
+    target_mode_help: Optional[str] = None,
+) -> argparse.ArgumentParser:
+    """Arguments shared by the Panda CL runners; only `--target-mode` differs between them."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs-root", type=str, default=str(RUNS))
     ap.add_argument("--strategy", choices=list(STRATEGIES), default="cumulative")
@@ -768,7 +788,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--rehearsal-capacity", type=int, default=5000)
 
     # Model / optimizer
-    ap.add_argument("--target-mode", choices=["max", "p90", "mean"], default="max")
+    ap.add_argument("--target-mode", choices=list(target_modes), default=target_mode_default, help=target_mode_help)
     ap.add_argument("--target-return", type=float, default=None, help="If set, overrides per-task target_return.")
     ap.add_argument("--d-model", type=int, default=128)
     ap.add_argument("--n-layers", type=int, default=3)
@@ -846,46 +866,3 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tsn-warmstart-noise-std", type=float, default=0.02)
     ap.add_argument("--tsn-warmstart-on-new-copy", action="store_true")
     return ap
-
-
-def _resolve_device(requested: str) -> str:
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision("high")
-    return "cuda" if (requested == "cuda" and torch.cuda.is_available()) else "cpu"
-
-
-def main():
-    args = build_arg_parser().parse_args()
-    _set_seed(args.seed)
-
-    device = _resolve_device(args.device)
-    print(f"[device] {device}")
-
-    tasks = load_tasks(args)
-    task_names = [t.name for t in tasks]
-    obs_dim = max(t.obs_dim for t in tasks)
-    act_dim = max(t.act_dim for t in tasks)
-
-    strategy = build_strategy(args, obs_dim, act_dim, device, n_tasks=len(tasks))
-
-    model_sig = _model_signature_from_model(strategy.model, fallback=_args_model_signature(args))
-    run_tag = f"{(args.tag or SPEC_TAG)}__{model_sig}{_reuse_signature(args)}"
-    run_dir = build_run_dir(args.runs_root, BENCH, args.strategy, tag=run_tag)
-    os.makedirs(run_dir, exist_ok=True)
-    print(f"\n[run_dir] {run_dir}")
-    print(f"[tasks] {task_names}")
-    print(f"[model_signature] {model_sig}")
-
-    try:
-        P = run_continual_learning(strategy, args, tasks, obs_dim, act_dim, device)
-        save_results(run_dir, strategy, args, tasks, P, model_sig, obs_dim, act_dim)
-    finally:
-        for t in tasks:
-            _close_env(t.env)
-
-    print("\nDone. Saved Panda CL results to:", run_dir)
-
-
-if __name__ == "__main__":
-    main()

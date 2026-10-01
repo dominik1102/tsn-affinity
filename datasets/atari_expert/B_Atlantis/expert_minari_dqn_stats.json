@@ -1,0 +1,38 @@
+{
+  "name": "B_Atlantis",
+  "dataset_id": "atari/atlantis/expert-v0",
+  "seed": 1,
+  "preprocess": "dqn",
+  "obs_dtype": "float32",
+  "dqn_size": 84,
+  "frame_stack": 4,
+  "clip_rewards": true,
+  "n_episodes": 10,
+  "max_len": 50000,
+  "total_steps_written": 270000,
+  "episode_lengths": [
+    27000,
+    27000,
+    27000,
+    27000,
+    27000,
+    27000,
+    27000,
+    27000,
+    27000,
+    27000
+  ],
+  "episode_returns": [
+    1546.0,
+    1545.0,
+    1543.0,
+    1553.0,
+    1554.0,
+    1551.0,
+    1556.0,
+    1551.0,
+    1545.0,
+    1556.0
+  ],
+  "hit_max_len_without_done": 0
+}

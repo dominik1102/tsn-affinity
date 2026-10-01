@@ -1,0 +1,38 @@
+[
+  {
+    "name": "D_Breakout",
+    "seed": 1,
+    "params": {
+      "game": "ALE/Breakout-v5",
+      "frame_stack": 4,
+      "clip_rewards": true
+    }
+  },
+  {
+    "name": "B_Atlantis",
+    "seed": 2,
+    "params": {
+      "game": "ALE/Atlantis-v5",
+      "frame_stack": 4,
+      "clip_rewards": true
+    }
+  },
+  {
+    "name": "C_Boxing",
+    "seed": 3,
+    "params": {
+      "game": "ALE/Boxing-v5",
+      "frame_stack": 4,
+      "clip_rewards": true
+    }
+  },
+  {
+    "name": "E_Centipede",
+    "seed": 4,
+    "params": {
+      "game": "ALE/Centipede-v5",
+      "frame_stack": 4,
+      "clip_rewards": true
+    }
+  }
+]
